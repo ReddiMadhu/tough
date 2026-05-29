@@ -1,0 +1,116 @@
+guid: "e5f6a7b8-c9d0-1234-efab-345678901234"
+liveboard:
+  name: "Executive Sales Dashboard"
+  description: "Key sales KPIs and trends"
+  visualizations:
+    - id: "viz_kpi_revenue"
+      answer:
+        name: "Total Revenue KPI"
+        tables:
+          - name: "Sales Analysis Model"
+            id: "model_1"
+            fqn: "d4e5f6a7-b8c9-0123-defa-234567890123"
+        search_query: "[Revenue]"
+        chart:
+          type: "KPI"
+        display_mode: "CHART_MODE"
+    - id: "viz_revenue_trend"
+      answer:
+        name: "Revenue Trend"
+        tables:
+          - name: "Sales Analysis Model"
+            id: "model_1"
+        search_query: "[Order Date] [Revenue]"
+        chart:
+          type: "COLUMN"
+          chart_columns:
+            - column:
+                name: "Order Date"
+              axis: "X_AXIS"
+            - column:
+                name: "Revenue"
+              axis: "Y_AXIS"
+        display_mode: "CHART_MODE"
+    - id: "viz_top_customers"
+      answer:
+        name: "Top 10 Customers"
+        tables:
+          - name: "Sales Analysis Model"
+            id: "model_1"
+        search_query: "[Customer Name] [Revenue] sort by [Revenue] descending top 10"
+        formulas:
+          - name: "Revenue Share"
+            expr: "sum(revenue) / group_sum(revenue)"
+            id: "local_rev_share"
+        chart:
+          type: "BAR"
+          chart_columns:
+            - column:
+                name: "Customer Name"
+              axis: "X_AXIS"
+            - column:
+                name: "Revenue"
+              axis: "Y_AXIS"
+        display_mode: "CHART_MODE"
+    - id: "viz_category_pie"
+      answer:
+        name: "Revenue by Category"
+        tables:
+          - name: "Sales Analysis Model"
+            id: "model_1"
+        search_query: "[Product Category] [Revenue]"
+        chart:
+          type: "PIE"
+          chart_columns:
+            - column:
+                name: "Product Category"
+              axis: "X_AXIS"
+            - column:
+                name: "Revenue"
+              axis: "Y_AXIS"
+        display_mode: "CHART_MODE"
+    - id: "viz_profit_margin"
+      answer:
+        name: "Profit Margin by Region"
+        tables:
+          - name: "Sales Analysis Model"
+            id: "model_1"
+        search_query: "[Region] [Profit Margin]"
+        chart:
+          type: "LINE"
+          chart_columns:
+            - column:
+                name: "Region"
+              axis: "X_AXIS"
+            - column:
+                name: "Profit Margin"
+              axis: "Y_AXIS"
+        display_mode: "CHART_MODE"
+    - id: "viz_data_table"
+      answer:
+        name: "Sales Details"
+        tables:
+          - name: "Sales Analysis Model"
+            id: "model_1"
+        search_query: "[Customer Name] [Product Category] [Revenue] [Cost] [Profit Margin]"
+        chart:
+          type: "TABLE"
+        display_mode: "TABLE_MODE"
+  filters:
+    - column: "Order Date"
+      oper: "BW_INC"
+      values: ["2024-01-01", "2024-12-31"]
+  layout:
+    tiles:
+      - visualization_id: "viz_kpi_revenue"
+        size: "SMALL"
+      - visualization_id: "viz_revenue_trend"
+        size: "LARGE"
+      - visualization_id: "viz_top_customers"
+        size: "LARGE"
+      - visualization_id: "viz_category_pie"
+        size: "MEDIUM"
+      - visualization_id: "viz_profit_margin"
+        size: "MEDIUM"
+      - visualization_id: "viz_data_table"
+        size: "LARGE"
