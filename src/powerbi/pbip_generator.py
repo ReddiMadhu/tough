@@ -82,7 +82,7 @@ class PBIPGenerator:
         )
 
     def _write_pbism_file(self):
-        pbism = {"version": "1.0", "datasetReference": {"byPath": None, "byConnection": None}}
+        pbism = {"version": "4.0"}
         (self.semantic_dir.parent / "definition.pbism").write_text(
             json.dumps(pbism, indent=2), encoding="utf-8"
         )
@@ -100,6 +100,11 @@ class PBIPGenerator:
         )
         (self.semantic_dir / "model.tmdl").write_text(tmdl, encoding="utf-8")
 
+    def _clean_column_name(self, col_name: str) -> str:
+        if not col_name:
+            return ""
+        return re.sub(r"[%\(\)#\$@/\-]", "", col_name).strip()
+
     def _write_table_tmdls(self, model: Dict[str, Any]):
         for table in model.get("tables", []):
             table_name = table.get("name", "Unknown")
@@ -116,7 +121,7 @@ class PBIPGenerator:
                 col_name = col.get("name", "")
                 ts_type = col.get("data_type", "VARCHAR")
                 pbi_type = self.DATA_TYPE_MAP.get(ts_type.upper() if ts_type else "", "string")
-                clean_name = re.sub(r"[%\(\)#\$@/\-]", "", col_name).strip()
+                clean_name = self._clean_column_name(col_name)
 
                 lines.append(f"    column '{clean_name}'")
                 lines.append(f"        dataType: {pbi_type}")
@@ -165,23 +170,32 @@ class PBIPGenerator:
         (self.tables_dir / "_Measures.tmdl").write_text("\n".join(lines), encoding="utf-8")
 
     def _write_relationships_tmdl(self, model: Dict[str, Any]):
-        lines = ["/// Relationships — Migrated from ThoughtSpot joins", ""]
+        lines = []
 
         for i, join in enumerate(model.get("joins", [])):
-            cardinality = self.CARDINALITY_MAP.get(
-                join.get("cardinality", "many-to-one").lower().replace("_", "-"), "manyToOne"
-            )
+            card = join.get("cardinality", "many-to-one").lower().replace("_", "-")
+            if card in ("one-to-one", "one_to_one"):
+                from_card, to_card = "one", "one"
+            elif card in ("many-to-many", "many_to_many"):
+                from_card, to_card = "many", "many"
+            elif card in ("one-to-many", "one_to_many"):
+                from_card, to_card = "one", "many"
+            else:  # many-to-one
+                from_card, to_card = "many", "one"
+
             cross_filter = self.CROSSFILTER_MAP.get(join.get("join_type", "LEFT_OUTER"), "oneDirection")
             rel_name = join.get("name") or f"rel_{i + 1}"
 
-            lines.append(f"/// Join: {rel_name}")
+            left_col = self._clean_column_name(join.get("left_column", ""))
+            right_col = self._clean_column_name(join.get("right_column", ""))
+
             lines.append(f"relationship {rel_name}")
-            lines.append(f"    fromColumn: '{join['left_table']}'[{join['left_column']}]")
-            lines.append(f"    toColumn: '{join['right_table']}'[{join['right_column']}]")
+            lines.append(f"    fromColumn: '{join['left_table']}'.'{left_col}'")
+            lines.append(f"    fromCardinality: {from_card}")
+            lines.append(f"    toColumn: '{join['right_table']}'.'{right_col}'")
+            lines.append(f"    toCardinality: {to_card}")
             lines.append(f"    crossFilteringBehavior: {cross_filter}")
-            lines.append(f"    cardinality: {cardinality}")
             lines.append(f"    isActive: true")
-            lines.append("")
 
         (self.semantic_dir / "relationships.tmdl").write_text("\n".join(lines), encoding="utf-8")
 

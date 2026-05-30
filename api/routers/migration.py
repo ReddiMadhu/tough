@@ -448,10 +448,24 @@ async def get_migration_calculations(migration_id: str):
 
 @router.get("/{migration_id}/validation-results")
 async def get_migration_validation_results(migration_id: str):
-    """Get raw validation results list."""
+    """Get validation results list and summary."""
     from storage.fidelity_validation_store import get_validation_results
     res = get_validation_results(config.DATABASE_PATH, migration_id)
-    return {"validation_results": res}
+    
+    total = len(res)
+    passed = sum(1 for r in res if r.get("overall_passed"))
+    failed = total - passed
+    pass_rate = (passed / total) * 100 if total > 0 else 100.0
+
+    return {
+        "results": res,
+        "summary": {
+            "total_conversions": total,
+            "passed": passed,
+            "failed": failed,
+            "pass_rate": pass_rate
+        }
+    }
 
 
 @router.get("/{migration_id}/fidelity-validation")

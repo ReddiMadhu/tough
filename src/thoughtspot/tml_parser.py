@@ -76,7 +76,8 @@ class TMLParser:
 
     def _parse_table_join(self, source_table: str, join_def: Dict):
         dest = join_def.get("destination", {})
-        left_col, right_col = self._parse_on_clause(join_def.get("on", ""))
+        on_clause = join_def.get("on") or join_def.get(True) or ""
+        left_col, right_col = self._parse_on_clause(on_clause)
         self.joins.append({
             "name": join_def.get("name", ""),
             "left_table": source_table,
@@ -162,7 +163,8 @@ class TMLParser:
         for join in model_data.get("joins", []):
             src_alias = join.get("source", "")
             dst_alias = join.get("destination", "")
-            left_col, right_col = self._parse_on_clause(join.get("on", ""))
+            on_clause = join.get("on") or join.get(True) or ""
+            left_col, right_col = self._parse_on_clause(on_clause)
             self.joins.append({
                 "name": join.get("name", ""),
                 "left_table": table_refs.get(src_alias, src_alias),
@@ -286,13 +288,36 @@ class TMLParser:
 
     def _parse_on_clause(self, on_clause: str):
         """Parse '[Table1::Col1] = [Table2::Col2]' → (col1, col2)."""
-        m = re.match(
-            r"\[([^:]+)::([^\]]+)\]\s*=\s*\[([^:]+)::([^\]]+)\]",
-            on_clause.strip(),
-        )
-        if m:
-            return m.group(2).strip(), m.group(4).strip()
-        return ("", "")
+        if not on_clause:
+            return ("", "")
+        on_str = str(on_clause).strip().strip("'\"")
+        parts = on_str.split("=")
+        if len(parts) != 2:
+            # Fallback to search
+            m = re.search(r"\[([^:]+)::([^\]]+)\]\s*=\s*\[([^:]+)::([^\]]+)\]", on_str)
+            if m:
+                return m.group(2).strip(), m.group(4).strip()
+            return ("", "")
+        
+        left_part = parts[0].strip()
+        right_part = parts[1].strip()
+        
+        left_match = re.search(r"([^:]+)::([^\]]+)", left_part)
+        right_match = re.search(r"([^:]+)::([^\]]+)", right_part)
+        
+        left_col = left_match.group(2).strip() if left_match else ""
+        right_col = right_match.group(2).strip() if right_match else ""
+        
+        if not left_col:
+            lm = re.search(r"\[?([^\]]+)\]?", left_part)
+            if lm:
+                left_col = lm.group(1).strip()
+        if not right_col:
+            rm = re.search(r"\[?([^\]]+)\]?", right_part)
+            if rm:
+                right_col = rm.group(1).strip()
+                
+        return left_col, right_col
 
     def _classify_formula(self, formula: str) -> str:
         if not formula:

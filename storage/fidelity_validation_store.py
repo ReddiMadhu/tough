@@ -39,7 +39,11 @@ def get_validation_results(db_path: str, migration_id: str) -> List[Dict[str, An
     conn = _connect(db_path)
     try:
         rows = conn.execute(
-            "SELECT * FROM ts_validation_results WHERE migration_id=? ORDER BY created_at DESC",
+            """SELECT r.*, c.measure_name 
+               FROM ts_validation_results r
+               LEFT JOIN ts_conversions c ON r.conversion_id = c.conversion_id
+               WHERE r.migration_id=? 
+               ORDER BY r.created_at DESC""",
             (migration_id,)
         ).fetchall()
         results = []
@@ -48,9 +52,11 @@ def get_validation_results(db_path: str, migration_id: str) -> List[Dict[str, An
             d["overall_passed"] = bool(d["overall_passed"])
             d["needs_manual_review"] = bool(d["needs_manual_review"])
             try:
-                d["test_results"] = json.loads(d["test_results"]) if d["test_results"] else []
+                slices = json.loads(d["test_results"]) if d["test_results"] else []
             except Exception:
-                d["test_results"] = []
+                slices = []
+            d["test_results"] = slices
+            d["test_slices"] = slices
             try:
                 d["error_categories"] = json.loads(d["error_categories"]) if d["error_categories"] else {}
             except Exception:

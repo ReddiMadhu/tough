@@ -107,14 +107,15 @@ OUTPUT DIRECTIONS:
    - "AGGREGATION_MISMATCH" (incorrect SUM/AVG/COUNT operator)
    - "MISSING_VALUE" (cannot calculate)
 3. Generate 3 to 5 realistic "mock_test_slices" showing a side-by-side comparison of results for specific dimension slices.
-   - Each slice should contain:
-     - "dimensions": a dictionary of keys and values (e.g., {{"Region": "North", "Year": "2024"}})
-     - "tableau_value": a mock expected number representing the ThoughtSpot output (e.g., 1500.0)
-     - "dax_value": the mock number returned by the DAX formula (equal to tableau_value if passed, otherwise differing)
-     - "delta": abs(tableau_value - dax_value)
-     - "relative_error": delta / abs(tableau_value) if tableau_value != 0 else 0
-     - "passed": boolean
-     - "error_category": string (e.g. "PERFECT_MATCH" or "CONTEXT_SHIFT")
+    - Each slice should contain:
+      - "dimensions": a dictionary of keys and values (e.g., {{"Region": "North", "Year": "2024"}})
+      - "source_value": a mock expected number representing the ThoughtSpot output (e.g., 1500.0)
+      - "tableau_value": a mock expected number representing the ThoughtSpot output (e.g., 1500.0)
+      - "dax_value": the mock number returned by the DAX formula (equal to source_value if passed, otherwise differing)
+      - "delta": abs(source_value - dax_value)
+      - "relative_error": delta / abs(source_value) if source_value != 0 else 0
+      - "passed": boolean
+      - "error_category": string (e.g. "PERFECT_MATCH" or "CONTEXT_SHIFT")
 
 Respond ONLY with a JSON object in this format (no markdown code-block wraps):
 {{
@@ -125,6 +126,7 @@ Respond ONLY with a JSON object in this format (no markdown code-block wraps):
   "test_slices": [
      {{
        "dimensions": {{"Region": "North"}},
+       "source_value": 150.0,
        "tableau_value": 150.0,
        "dax_value": 150.0,
        "delta": 0.0,
@@ -229,6 +231,7 @@ Respond ONLY with a JSON object in this format (no markdown code-block wraps):
             slices.append({
                 "dimensions": dim,
                 "tableau_value": base_val,  # UI uses tableau_value key for original metric
+                "source_value": base_val,   # Map source_value for front-end compatibility
                 "dax_value": dax_val,
                 "delta": delta,
                 "relative_error": rel_err,
@@ -256,6 +259,7 @@ Respond ONLY with a JSON object in this format (no markdown code-block wraps):
         slices = [{
             "dimensions": {"Error": "Syntax Check"},
             "tableau_value": 0.0,
+            "source_value": 0.0,
             "dax_value": 0.0,
             "delta": 0.0,
             "relative_error": 0.0,
