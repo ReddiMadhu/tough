@@ -8,3 +8,5 @@ python-dotenv>=1.0.1
 pydantic>=2.9.0
 pydantic-settings>=2.0.0
 aiofiles>=23.0.0
+langchain-openai>=0.1.0
+

@@ -75,6 +75,11 @@ class MigrationStatusResponse(BaseModel):
     medium_confidence:  int = 0
     low_confidence:     int = 0
     requires_review:    int = 0
+    progress_percent:   Optional[int] = 0
+    current_stage:      Optional[str] = None
+    workbook_count:     Optional[int] = 0
+    calculation_count:  Optional[int] = 0
+    relationship_count: Optional[int] = 0
     error_message:      Optional[str] = None
     elapsed_seconds:    Optional[float] = None
     created_at:         Optional[str] = None

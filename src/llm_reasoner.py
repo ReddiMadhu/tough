@@ -51,9 +51,18 @@ class LLMReasoner:
             logger.info(f"LLM Semantic Reasoning Layer initialized successfully: {self.deployment}")
 
         except ImportError:
-            logger.error("langchain-openai is not installed. Fallback to offline regex.")
+            logger.warning("langchain-openai is not installed. Fallback to offline regex.")
         except Exception as e:
             logger.error(f"Failed to initialize LLM: {e}")
+
+    def reason(self, prompt: str) -> str:
+        """
+        Execute a raw prompt against the LLM and return the string content response.
+        """
+        if not self.llm:
+            raise ValueError("LLM is not initialized")
+        response = self.llm.invoke(prompt)
+        return response.content
 
     def translate_formula(
         self, formula: str, measure_name: str, schema_context: Optional[str] = None

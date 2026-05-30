@@ -2,14 +2,17 @@
 MigrationOrchestrator — main pipeline coordinator.
 
 Pipeline:
-  Phase 1 (0-20%):   Load & parse TML files
-  Phase 2 (20-60%):  Convert formulas to DAX
-  Phase 3 (60-80%):  Generate PBIP project
-  Phase 4 (80-90%):  Generate Excel + DAX + JSON exports
-  Phase 5 (90-100%): Package outputs as ZIP
+  Phase 1 (0-15%):   Load & parse TML files
+  Phase 2 (15-30%):  Build Logic Graph (dependency DAG)
+  Phase 3 (30-55%):  Convert formulas to DAX (topological order)
+  Phase 4 (55-75%):  Generate PBIP project
+  Phase 5 (75-85%):  Generate Excel + DAX + JSON exports
+  Phase 6 (85-95%):  Package outputs as ZIP
+  Phase 7 (95-100%): Finalize
 """
 import uuid
 import time
+import json
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Callable
 from loguru import logger
@@ -22,7 +25,14 @@ from src.export.excel_report import ExcelReportGenerator
 from src.export.dax_exporter import export_dax_file
 from src.export.json_exporter import export_json_model
 from src.export.zip_packager import package_outputs, package_pbip_only
-from storage.migration_store import update_migration_status, save_conversions
+from storage.migration_store import (
+    update_migration_status,
+    save_conversions,
+    update_migration_progress,
+    save_calculations_batch,
+    save_logic_graph,
+    update_migration_counts,
+)
 
 
 class MigrationOrchestrator:
@@ -34,13 +44,20 @@ class MigrationOrchestrator:
         self.loader = SpotAppLoader()
         self.parser = TMLParser()
 
-    def execute(self, migration_id: str, file_paths: List[str]):
+    def execute(self, migration_id: str, file_paths: List[str], progress_callback=None):
         """Run the complete pipeline synchronously (called from background thread)."""
         start_time = time.time()
         logger.info(f"[{migration_id}] Starting migration pipeline")
 
+        def _progress(stage: str, percent: int, message: str):
+            """Report progress via callback and DB."""
+            update_migration_progress(self.db_path, migration_id, percent, stage, message)
+            if progress_callback:
+                progress_callback.update(stage, percent, message)
+
         try:
-            # ── Phase 1: Parse ────────────────────────────────────────────────
+            # ── Phase 1: Parse TML files ──────────────────────────────────────
+            _progress("parsing", 5, "Parsing ThoughtSpot TML files...")
             logger.info(f"[{migration_id}] Phase 1: Parsing TML files...")
             spotapp_data = self.loader.load_files(file_paths)
             intermediate_model = self.parser.parse_all(spotapp_data)
@@ -56,9 +73,17 @@ class MigrationOrchestrator:
                 f"[{migration_id}] Parsed: {table_count} tables, "
                 f"{len(formula_columns)} formulas, {viz_count} viz, {join_count} joins"
             )
+            _progress("parsing", 15, f"Parsed {table_count} tables, {len(formula_columns)} formulas")
 
-            # ── Phase 2: Convert formulas to DAX ─────────────────────────────
-            logger.info(f"[{migration_id}] Phase 2: Converting formulas to DAX...")
+            # ── Phase 2: Build Logic Graph ────────────────────────────────────
+            _progress("building_graph", 18, "Building calculation dependency graph...")
+            logger.info(f"[{migration_id}] Phase 2: Building logic graph...")
+            graph_data = self._build_logic_graph(migration_id, intermediate_model, formula_columns)
+            _progress("building_graph", 28, f"Built graph with {len(graph_data.get('nodes', []))} nodes")
+
+            # ── Phase 3: Convert formulas to DAX ─────────────────────────────
+            _progress("converting", 30, "Converting formulas to DAX...")
+            logger.info(f"[{migration_id}] Phase 3: Converting formulas to DAX...")
             col_table_map = self._build_col_table_map(intermediate_model)
             default_table = (
                 intermediate_model["tables"][0]["name"]
@@ -72,6 +97,7 @@ class MigrationOrchestrator:
             )
 
             dax_conversions = []
+            total_formulas = len(formula_columns)
             for i, col in enumerate(formula_columns):
                 measure_name = col.get("caption") or col.get("internal_name") or f"Measure_{i}"
                 result = converter.convert(col["formula"], measure_name)
@@ -90,10 +116,70 @@ class MigrationOrchestrator:
                     "source_object_type": col.get("source_object_type", ""),
                 })
 
+                # Granular progress within conversion phase
+                if total_formulas > 0:
+                    conv_pct = 30 + int(((i + 1) / total_formulas) * 25)
+                    _progress("converting", conv_pct, f"Converted {i + 1}/{total_formulas} formulas")
+
             logger.info(f"[{migration_id}] Converted {len(dax_conversions)} formulas")
 
-            # ── Phase 3: Generate PBIP ────────────────────────────────────────
-            logger.info(f"[{migration_id}] Phase 3: Generating PBIP project...")
+            # ── Phase 3.5: Validate & Self-Heal Conversions ───────────────────
+            _progress("validating", 50, "Validating DAX conversions and running self-healing agent...")
+            logger.info(f"[{migration_id}] Phase 3.5: Validating conversions...")
+            
+            from src.validation.validation_engine import ValidationEngine
+            from src.agents.self_healer import SelfHealingAgent
+            from storage.fidelity_validation_store import save_validation_result, save_correction_attempt
+
+            val_engine = ValidationEngine()
+            healer = SelfHealingAgent(max_attempts=3)
+
+            for idx, conv in enumerate(dax_conversions):
+                c_id = conv["conversion_id"]
+                meas_name = conv["measure_name"]
+                orig_f = conv["original_formula"]
+                curr_dax = conv["dax_formula"]
+                conf = conv["confidence"]
+
+                # 1. Run validation
+                val_res = val_engine.validate(c_id, orig_f, curr_dax, meas_name, conf, migration_id)
+                save_validation_result(self.db_path, migration_id, c_id, val_res)
+
+                # 2. Self-healing loop if failed
+                attempt_num = 1
+                while not val_res.get("overall_passed") and attempt_num <= 3:
+                    attempt = healer.correct_dax(
+                        original_formula=orig_f,
+                        failed_dax=curr_dax,
+                        failures=val_res.get("test_slices", []),
+                        attempt_number=attempt_num,
+                        measure_name=meas_name
+                    )
+                    save_correction_attempt(self.db_path, migration_id, c_id, attempt)
+
+                    # Update and re-validate
+                    curr_dax = attempt["corrected_dax"]
+                    val_res = val_engine.validate(c_id, orig_f, curr_dax, meas_name, conf, migration_id)
+                    save_validation_result(self.db_path, migration_id, c_id, val_res)
+
+                    attempt_num += 1
+
+                # Update conversion list
+                conv["dax_formula"] = curr_dax
+                if val_res.get("overall_passed"):
+                    conv["confidence"] = 1.0
+                    conv["requires_review"] = False
+                else:
+                    conv["confidence"] = min(conv["confidence"], 0.5)
+                    conv["requires_review"] = True
+                    if "Self-healing could not fully resolve validation discrepancies. Manual review required." not in conv["notes"]:
+                        conv["notes"].append("Self-healing could not fully resolve validation discrepancies. Manual review required.")
+
+            logger.info(f"[{migration_id}] Completed validation and self-healing")
+
+            # ── Phase 4: Generate PBIP ────────────────────────────────────────
+            _progress("generating_pbip", 65, "Generating Power BI project...")
+            logger.info(f"[{migration_id}] Phase 4: Generating PBIP project...")
             export_path = Path(self.export_dir) / migration_id
             export_path.mkdir(parents=True, exist_ok=True)
 
@@ -101,8 +187,37 @@ class MigrationOrchestrator:
             pbip_gen = PBIPGenerator(project_name, str(export_path / "pbip"))
             pbip_path = pbip_gen.generate(intermediate_model, dax_conversions)
 
-            # ── Phase 4: Generate exports ─────────────────────────────────────
-            logger.info(f"[{migration_id}] Phase 4: Generating Excel + DAX + JSON...")
+            # ── Phase 4.5: Model Enhancement Detection ───────────────────────
+            _progress("enhancing", 70, "Detecting required Power BI model enhancements...")
+            logger.info(f"[{migration_id}] Phase 4.5: Running model enhancement agent...")
+            
+            from src.powerbi.model_enhancement_agent import ModelEnhancementAgent
+            from src.powerbi.enhancement_guide_generator import EnhancementGuideGenerator
+            from storage.fidelity_validation_store import save_model_enhancement, clear_model_enhancements
+
+            clear_model_enhancements(self.db_path, migration_id)
+            
+            enh_agent = ModelEnhancementAgent()
+            enhancements = []
+            
+            for conv in dax_conversions:
+                orig_f = conv["original_formula"]
+                curr_d = conv["dax_formula"]
+                name = conv["measure_name"]
+                
+                enh = enh_agent.assess(orig_f, curr_d, name, default_table)
+                if enh:
+                    save_model_enhancement(self.db_path, migration_id, enh)
+                    enhancements.append(enh)
+
+            guide_gen = EnhancementGuideGenerator()
+            guide_file_path = guide_gen.generate_guide(enhancements, export_path)
+            guide_path_str = str(guide_file_path) if guide_file_path else None
+            logger.info(f"[{migration_id}] Detected {len(enhancements)} model enhancements")
+
+            # ── Phase 5: Generate exports ─────────────────────────────────────
+            _progress("exporting", 75, "Generating Excel + DAX + JSON exports...")
+            logger.info(f"[{migration_id}] Phase 5: Generating Excel + DAX + JSON...")
             
             # Generate AI Narrative Summary if LLM is enabled
             narrative_summary = None
@@ -133,8 +248,9 @@ class MigrationOrchestrator:
             dax_path = export_dax_file(dax_conversions, str(export_path), migration_id)
             json_path = export_json_model(intermediate_model, str(export_path), migration_id)
 
-            # ── Phase 5: Package ──────────────────────────────────────────────
-            logger.info(f"[{migration_id}] Phase 5: Packaging outputs...")
+            # ── Phase 6: Package ──────────────────────────────────────────────
+            _progress("packaging", 88, "Packaging migration outputs...")
+            logger.info(f"[{migration_id}] Phase 6: Packaging outputs...")
             zip_path = package_outputs(
                 export_dir=str(export_path),
                 migration_id=migration_id,
@@ -142,6 +258,7 @@ class MigrationOrchestrator:
                 excel_path=excel_path,
                 dax_path=dax_path,
                 json_path=json_path,
+                guide_path=guide_path_str,
             )
 
             # PBIP-only zip
@@ -174,7 +291,7 @@ class MigrationOrchestrator:
                 narrative_summary=narrative_summary,
             )
 
-
+            _progress("completed", 100, f"Migration complete in {round(elapsed, 1)}s")
             logger.info(f"[{migration_id}] ✅ Migration complete in {elapsed:.1f}s")
 
         except Exception as e:
@@ -212,3 +329,46 @@ class MigrationOrchestrator:
         if file_paths:
             return Path(file_paths[0]).stem.replace(" ", "_")
         return "ThoughtSpot_Migration"
+
+    def _build_logic_graph(
+        self,
+        migration_id: str,
+        model: Dict[str, Any],
+        formula_columns: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Build dependency graph and save calculations & visualization data to database."""
+        from src.thoughtspot.logic_graph_builder import LogicGraphBuilder
+        
+        # Build base field metadata
+        base_field_metadata = {}
+        for table in model.get("tables", []):
+            table_name = table.get("name", "")
+            for col in table.get("column_details", []):
+                col_name = col.get("name", "")
+                base_field_metadata[col_name] = {
+                    "type": col.get("data_type", "VARCHAR"),
+                    "generic_type": "NUMERIC" if col.get("column_type") == "MEASURE" else "TEXT",
+                    "table": table_name
+                }
+                
+        builder = LogicGraphBuilder()
+        builder.build_graph(model, base_field_metadata)
+        
+        # Save calculations to DB
+        calcs_dict = builder.to_dict()
+        save_calculations_batch(self.db_path, migration_id, calcs_dict.get("nodes", []))
+        
+        # Save logic graph JSON (for ReactFlow visualization)
+        reactflow_data = builder.export_for_reactflow()
+        save_logic_graph(self.db_path, migration_id, json.dumps(reactflow_data))
+        
+        # Also update workbook count, calculation count, relationship count
+        update_migration_counts(
+            db_path=self.db_path,
+            migration_id=migration_id,
+            workbook_count=len(model.get("worksheets", [])),
+            calculation_count=len(formula_columns),
+            relationship_count=len(model.get("joins", []))
+        )
+        
+        return reactflow_data

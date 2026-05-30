@@ -12,6 +12,7 @@ def package_outputs(
     excel_path: Optional[str] = None,
     dax_path: Optional[str] = None,
     json_path: Optional[str] = None,
+    guide_path: Optional[str] = None,
 ) -> str:
     """
     Create a master ZIP containing all migration outputs.
@@ -33,6 +34,7 @@ def package_outputs(
             (excel_path, f"{migration_id}_migration_report.xlsx"),
             (dax_path, f"{migration_id}_measures.dax"),
             (json_path, f"{migration_id}_intermediate_model.json"),
+            (guide_path, "MODEL_ENHANCEMENTS_REQUIRED.md"),
         ]:
             if path and Path(path).exists():
                 zf.write(path, arcname)
