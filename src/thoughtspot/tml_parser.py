@@ -286,28 +286,42 @@ class TMLParser:
 
     # ── Utilities ──────────────────────────────────────────────────────────────
 
-    def _parse_on_clause(self, on_clause: str):
-        """Parse '[Table1::Col1] = [Table2::Col2]' → (col1, col2)."""
+    def _parse_on_clause(self, on_clause):
+        """Parse '[Table1::Col1] = [Table2::Col2]' → (col1, col2).
+        
+        Handles edge cases:
+        - PyYAML 1.1 may parse the key 'on' as boolean True
+        - Values may or may not be bracket-quoted
+        """
+        # Handle boolean True from PyYAML 1.1 (key 'on' → True)
+        if on_clause is True or on_clause is False:
+            return ("", "")
         if not on_clause:
             return ("", "")
+
         on_str = str(on_clause).strip().strip("'\"")
+
+        # Try full regex match first: [Table::Col] = [Table::Col]
+        m = re.search(r"\[([^:]+)::([^\]]+)\]\s*=\s*\[([^:]+)::([^\]]+)\]", on_str)
+        if m:
+            return m.group(2).strip(), m.group(4).strip()
+
+        # Fallback: split on '=' and extract columns
         parts = on_str.split("=")
         if len(parts) != 2:
-            # Fallback to search
-            m = re.search(r"\[([^:]+)::([^\]]+)\]\s*=\s*\[([^:]+)::([^\]]+)\]", on_str)
-            if m:
-                return m.group(2).strip(), m.group(4).strip()
+            logger.warning(f"Could not parse on-clause: {on_str}")
             return ("", "")
-        
+
         left_part = parts[0].strip()
         right_part = parts[1].strip()
-        
-        left_match = re.search(r"([^:]+)::([^\]]+)", left_part)
-        right_match = re.search(r"([^:]+)::([^\]]+)", right_part)
-        
-        left_col = left_match.group(2).strip() if left_match else ""
-        right_col = right_match.group(2).strip() if right_match else ""
-        
+
+        left_match = re.search(r"([^:\[]+)::([^\]]+)\]?", left_part)
+        right_match = re.search(r"([^:\[]+)::([^\]]+)\]?", right_part)
+
+        left_col = left_match.group(2).strip().rstrip("]") if left_match else ""
+        right_col = right_match.group(2).strip().rstrip("]") if right_match else ""
+
+        # Last resort: use the raw value after stripping brackets
         if not left_col:
             lm = re.search(r"\[?([^\]]+)\]?", left_part)
             if lm:
@@ -316,7 +330,7 @@ class TMLParser:
             rm = re.search(r"\[?([^\]]+)\]?", right_part)
             if rm:
                 right_col = rm.group(1).strip()
-                
+
         return left_col, right_col
 
     def _classify_formula(self, formula: str) -> str:

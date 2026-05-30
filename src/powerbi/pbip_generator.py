@@ -47,6 +47,20 @@ class PBIPGenerator:
         "RIGHT_OUTER": "oneDirection", "FULL_OUTER": "bothDirections",
     }
 
+    AGGREGATION_MAP = {
+        "sum": "sum",
+        "avg": "average",
+        "average": "average",
+        "min": "min",
+        "max": "max",
+        "count": "count",
+        "count_distinct": "distinctCount",
+        "distinctcount": "distinctCount",
+        "distinct_count": "distinctCount",
+        "unique_count": "distinctCount",
+        "none": "none",
+    }
+
     def __init__(self, project_name: str, output_dir: str):
         self.project_name = re.sub(r"[^\w\-]", "_", project_name)
         self.output_dir = Path(output_dir)
@@ -95,7 +109,7 @@ class PBIPGenerator:
             f"model Model\n"
             f"    culture: en-US\n"
             f"    defaultPowerBIDataSourceVersion: powerBI_V3\n"
-            f"    sourceQueryCulture: en-US\n\n"
+            f"    sourceQueryCulture: en-US\n"
             f"    annotation __TsMigration = '{source_type}'\n"
         )
         (self.semantic_dir / "model.tmdl").write_text(tmdl, encoding="utf-8")
@@ -131,12 +145,23 @@ class PBIPGenerator:
                     lines.append(f"        formatString: {col['format_pattern']}")
 
                 if col.get("column_type") == "MEASURE":
-                    agg = col.get("aggregation", "sum").lower() or "sum"
+                    raw_agg = (col.get("aggregation") or "sum").lower()
+                    agg = self.AGGREGATION_MAP.get(raw_agg, "sum")
                     lines.append(f"        summarizeBy: {agg}")
                 else:
                     lines.append(f"        summarizeBy: none")
 
                 lines.append("")
+
+            # Power BI requires at least one partition per table
+            lines.append(f"    partition '{table_name}' = m")
+            lines.append(f"        mode: import")
+            lines.append(f"        source =")
+            lines.append(f"            let")
+            lines.append(f"                Source = Sql.Database(\"{table.get('database', 'Unknown')}\", \"{table.get('schema', 'Unknown')}\")")
+            lines.append(f"            in")
+            lines.append(f"                Source")
+            lines.append("")
 
             (self.tables_dir / f"{safe_name}.tmdl").write_text("\n".join(lines), encoding="utf-8")
 
@@ -146,21 +171,60 @@ class PBIPGenerator:
             "/// Migrated from ThoughtSpot formulas",
             "table '_Measures'",
             "",
+            "    partition '_Measures' = calculated",
+            "        mode: import",
+            "        source = Row(\"Column\", BLANK())",
+            "",
         ]
 
+        # Deduplicate measures by name — keep the first (highest confidence) version
+        seen_names: Dict[str, bool] = {}
+        unique_conversions = []
         for conv in conversions:
+            mname = conv.get("measure_name", "")
+            if mname not in seen_names:
+                seen_names[mname] = True
+                unique_conversions.append(conv)
+
+        for conv in unique_conversions:
             measure_name = conv.get("measure_name", "")
             dax = conv.get("dax_formula", "")
             original = conv.get("original_formula", "")
             confidence = conv.get("confidence", 0)
 
+            # Skip empty / comment-only DAX
+            if not dax or dax.startswith("--"):
+                continue
+
             # Extract expression part (after "Name = ")
             eq_pos = dax.find(" = ")
             dax_expr = dax[eq_pos + 3:].strip() if eq_pos >= 0 else dax
 
+            # Remove any leading comment lines from the expression
+            expr_lines = dax_expr.split("\n")
+            expr_lines = [l for l in expr_lines if not l.strip().startswith("--")]
+            dax_expr = "\n".join(expr_lines).strip()
+
+            if not dax_expr:
+                continue
+
             lines.append(f"    /// ThoughtSpot: {original}")
             lines.append(f"    /// Confidence: {confidence:.0%}")
-            lines.append(f"    measure '{measure_name}' = {dax_expr}")
+
+            if "\n" in dax_expr:
+                # Multi-line DAX: wrap in TMDL triple-backtick expression block
+                lines.append(f"    measure '{measure_name}' =")
+                lines.append(f"        ```")
+                for expr_line in dax_expr.split("\n"):
+                    stripped = expr_line.rstrip()
+                    # Ensure at least 8-space indent inside backtick block
+                    if stripped:
+                        lines.append(f"        {stripped.lstrip()}")
+                    else:
+                        lines.append("")
+                lines.append(f"        ```")
+            else:
+                lines.append(f"    measure '{measure_name}' = {dax_expr}")
 
             if conv.get("format_pattern"):
                 lines.append(f"        formatString: {conv['format_pattern']}")
@@ -171,23 +235,35 @@ class PBIPGenerator:
 
     def _write_relationships_tmdl(self, model: Dict[str, Any]):
         lines = []
+        joins = model.get("joins", [])
 
-        for i, join in enumerate(model.get("joins", [])):
+        for i, join in enumerate(joins):
             card = join.get("cardinality", "many-to-one").lower().replace("_", "-")
-            if card in ("one-to-one", "one_to_one"):
+            if card in ("one-to-one",):
                 from_card, to_card = "one", "one"
-            elif card in ("many-to-many", "many_to_many"):
+            elif card in ("many-to-many",):
                 from_card, to_card = "many", "many"
-            elif card in ("one-to-many", "one_to_many"):
+            elif card in ("one-to-many",):
                 from_card, to_card = "one", "many"
-            else:  # many-to-one
+            else:  # many-to-one (default)
                 from_card, to_card = "many", "one"
 
             cross_filter = self.CROSSFILTER_MAP.get(join.get("join_type", "LEFT_OUTER"), "oneDirection")
+            # Sanitize relationship name — must be valid TMDL identifier (no spaces)
             rel_name = join.get("name") or f"rel_{i + 1}"
+            rel_name = re.sub(r"[^\w]", "_", rel_name)
 
             left_col = self._clean_column_name(join.get("left_column", ""))
             right_col = self._clean_column_name(join.get("right_column", ""))
+
+            # Skip relationships with empty column references
+            if not left_col or not right_col:
+                logger.warning(f"Skipping relationship '{rel_name}': missing column references")
+                continue
+
+            # Separate relationships with a blank line (but not before the first one)
+            if lines:
+                lines.append("")
 
             lines.append(f"relationship {rel_name}")
             lines.append(f"    fromColumn: '{join['left_table']}'.'{left_col}'")
