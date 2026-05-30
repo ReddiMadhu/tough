@@ -11,7 +11,7 @@ import uuid
 import threading
 import json
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import asyncio
 
 from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks, Query
