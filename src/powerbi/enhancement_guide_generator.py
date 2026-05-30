@@ -3,7 +3,7 @@ Model Enhancement Guide Generator - ThoughtSpot version.
 Creates markdown guides for required model improvements.
 """
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from loguru import logger
 
 from src.powerbi.model_enhancement_agent import EnhancementType
