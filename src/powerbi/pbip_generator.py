@@ -212,12 +212,10 @@ class PBIPGenerator:
             lines.append(f"    /// Confidence: {confidence:.0%}")
 
             if "\n" in dax_expr:
-                # Multi-line DAX: wrap in TMDL triple-backtick expression block
-                lines.append(f"    measure '{measure_name}' =")
-                lines.append(f"        ```")
+                # Multi-line DAX: wrap in TMDL triple-backtick block
+                lines.append(f"    measure '{measure_name}' = ```")
                 for expr_line in dax_expr.split("\n"):
                     stripped = expr_line.rstrip()
-                    # Ensure at least 8-space indent inside backtick block
                     if stripped:
                         lines.append(f"        {stripped.lstrip()}")
                     else:

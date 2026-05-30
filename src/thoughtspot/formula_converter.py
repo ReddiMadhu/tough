@@ -34,9 +34,10 @@ class DAXResult:
 class ThoughtSpotFormulaConverter:
     """Convert ThoughtSpot formulas to Power BI DAX measures."""
 
-    def __init__(self, table_name: str = "Table", column_table_map: Dict[str, str] = None):
+    def __init__(self, table_name: str = "Table", column_table_map: Dict[str, str] = None, column_metadata: Dict[str, Dict[str, Any]] = None):
         self.default_table = table_name
         self.col_table_map: Dict[str, str] = column_table_map or {}
+        self.column_metadata = column_metadata or {}
         self.known_measures: set = set()
         
         # Build normalized column mapping (case-insensitive, space/underscore equivalent)
@@ -44,6 +45,30 @@ class ThoughtSpotFormulaConverter:
         for col, table in self.col_table_map.items():
             norm_name = self._normalize_identifier(col)
             self.norm_col_map[norm_name] = (table, col)
+
+        # Build normalized column metadata mapping
+        self.norm_col_metadata = {}
+        for col_name, meta in self.column_metadata.items():
+            norm_name = self._normalize_identifier(col_name)
+            self.norm_col_metadata[norm_name] = meta
+
+    def get_aggregator(self, col_name: str) -> str:
+        """Get the default aggregator for a column (e.g. SUM, AVERAGE, MAX)."""
+        norm = self._normalize_identifier(col_name)
+        meta = self.norm_col_metadata.get(norm, {})
+        col_type = meta.get("column_type", "ATTRIBUTE")
+        agg = (meta.get("aggregation") or "").upper()
+        
+        if col_type == "MEASURE":
+            if agg in ("SUM", "AVG", "AVERAGE", "MIN", "MAX", "COUNT", "DISTINCTCOUNT", "DISTINCT_COUNT", "STDDEV", "VARIANCE"):
+                if agg == "AVG":
+                    return "AVERAGE"
+                if agg in ("DISTINCTCOUNT", "DISTINCT_COUNT"):
+                    return "DISTINCTCOUNT"
+                return agg
+            return "SUM"  # Default aggregator for measures
+        else:
+            return "MAX"  # Default for attributes
 
     def convert(self, formula: str, measure_name: str) -> DAXResult:
         """Convert a single ThoughtSpot formula to a DAX measure."""
@@ -70,6 +95,7 @@ class ThoughtSpotFormulaConverter:
             self._try_text_function,
             self._try_simple_aggregation,
             self._try_arithmetic,
+            self._try_single_column,
             self._try_fallback,
         ]
 
@@ -80,6 +106,36 @@ class ThoughtSpotFormulaConverter:
                 return result
 
         return self._try_fallback(formula, measure_name)
+
+    def _try_single_column(self, formula: str, name: str) -> Optional[DAXResult]:
+        """Detect and convert standalone column references, wrapping them in default aggregators."""
+        stripped = formula.strip().strip("'\"[]")
+        # Check if it is a single valid identifier name (letters, numbers, spaces, underscores)
+        if re.match(r"^[a-zA-Z_][a-zA-Z0-9_\s]*$", stripped):
+            resolved = self._resolve_col_name_only(stripped)
+            if resolved:
+                if resolved.startswith("[") and resolved.endswith("]"):
+                    # Bare measure reference — do not wrap in an aggregator
+                    return DAXResult(
+                        original_formula=formula,
+                        dax_formula=f"{name} = {resolved}",
+                        measure_name=name,
+                        confidence=0.95,
+                        pattern="MEASURE_REFERENCE",
+                        notes=[f"Bare measure reference '{stripped}' resolved directly"],
+                    )
+                else:
+                    # Bare table column reference — wrap in default aggregator
+                    agg = self.get_aggregator(stripped)
+                    return DAXResult(
+                        original_formula=formula,
+                        dax_formula=f"{name} = {agg}({resolved})",
+                        measure_name=name,
+                        confidence=0.95,
+                        pattern="SINGLE_COLUMN",
+                        notes=[f"Bare column '{stripped}' wrapped in default aggregator {agg}()"],
+                    )
+        return None
 
     # ── Column resolution ──────────────────────────────────────────────────────
 
@@ -106,21 +162,21 @@ class ThoughtSpotFormulaConverter:
         """Resolve a single column/measure name to its DAX reference format."""
         norm = self._normalize_identifier(col_name)
         
+        # Check known measures first
+        for m in self.known_measures:
+            if self._normalize_identifier(m) == norm:
+                return f"[{m}]"
+                
         # Check normalized map
         if norm in self.norm_col_map:
             table, orig_name = self.norm_col_map[norm]
             if table is None:
                 return f"[{orig_name}]"
             return f"'{table}'[{orig_name}]"
-            
-        # Check known measures
-        for m in self.known_measures:
-            if self._normalize_identifier(m) == norm:
-                return f"[{m}]"
                 
         return None
 
-    def _resolve_expr_identifiers(self, expr: str) -> str:
+    def _resolve_expr_identifiers(self, expr: str, wrap_bare_columns: bool = False) -> str:
         """Resolve all column and measure references in a complex expression string."""
         literals = []
         def mask_literal(m):
@@ -138,6 +194,12 @@ class ThoughtSpotFormulaConverter:
                 inner = token[1:-1]
                 resolved = self._resolve_col_name_only(inner)
                 if resolved:
+                    # Measure references (enclosed in brackets e.g. [MeasureName]) do not need aggregators
+                    if resolved.startswith("[") and resolved.endswith("]"):
+                        return resolved
+                    if wrap_bare_columns:
+                        agg = self.get_aggregator(inner)
+                        return f"{agg}({resolved})"
                     return resolved
                 return token
                 
@@ -152,6 +214,12 @@ class ThoughtSpotFormulaConverter:
                 
             resolved = self._resolve_col_name_only(token)
             if resolved:
+                # Measure references (enclosed in brackets e.g. [MeasureName]) do not need aggregators
+                if resolved.startswith("[") and resolved.endswith("]"):
+                    return resolved
+                if wrap_bare_columns:
+                    agg = self.get_aggregator(token)
+                    return f"{agg}({resolved})"
                 return resolved
             return token
 
@@ -427,8 +495,8 @@ class ThoughtSpotFormulaConverter:
         )
         if not m:
             return None
-        condition = self._convert_expr(m.group(1).strip())
-        then_val = self._convert_expr(m.group(2).strip())
+        condition = self._convert_expr(m.group(1).strip(), wrap_bare_columns=True)
+        then_val = self._convert_expr(m.group(2).strip(), wrap_bare_columns=True)
         else_val = m.group(3).strip()
 
         if else_val.lower().startswith("if "):
@@ -436,7 +504,7 @@ class ThoughtSpotFormulaConverter:
             nested_dax = nested.dax_formula.replace("__nested__ = ", "").strip()
             dax = f"{name} = \n    IF({condition}, {then_val}, {nested_dax})"
         else:
-            else_dax = self._convert_expr(else_val)
+            else_dax = self._convert_expr(else_val, wrap_bare_columns=True)
             dax = f"{name} = IF({condition}, {then_val}, {else_dax})"
 
         return DAXResult(
@@ -525,8 +593,8 @@ class ThoughtSpotFormulaConverter:
         # Safe division
         div_m = re.match(r"^(.+?)\s*/\s*(.+)$", formula.strip())
         if div_m:
-            num = self._convert_expr(div_m.group(1).strip())
-            den = self._convert_expr(div_m.group(2).strip())
+            num = self._convert_expr(div_m.group(1).strip(), wrap_bare_columns=True)
+            den = self._convert_expr(div_m.group(2).strip(), wrap_bare_columns=True)
             return DAXResult(
                 original_formula=formula,
                 dax_formula=f"{name} = DIVIDE({num}, {den}, 0)",
@@ -537,7 +605,7 @@ class ThoughtSpotFormulaConverter:
             )
         # General arithmetic
         if re.search(r"[+\-*]", formula):
-            dax_expr = self._convert_expr(formula)
+            dax_expr = self._convert_expr(formula, wrap_bare_columns=True)
             return DAXResult(
                 original_formula=formula,
                 dax_formula=f"{name} = {dax_expr}",
@@ -616,7 +684,7 @@ class ThoughtSpotFormulaConverter:
 
     # ── Expression helpers ─────────────────────────────────────────────────────
 
-    def _convert_expr(self, expr: str) -> str:
+    def _convert_expr(self, expr: str, wrap_bare_columns: bool = False) -> str:
         """Convert a sub-expression."""
         expr = expr.strip().strip("()")
         
@@ -633,7 +701,7 @@ class ThoughtSpotFormulaConverter:
             return f'"{expr[1:-1]}"'
             
         # Otherwise, resolve all identifier tokens in the expression
-        return self._resolve_expr_identifiers(expr)
+        return self._resolve_expr_identifiers(expr, wrap_bare_columns)
 
     def _split_args(self, args_str: str) -> List[str]:
         """Split function arguments respecting nested parens."""

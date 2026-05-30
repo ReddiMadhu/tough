@@ -7,7 +7,7 @@ import json
 from typing import Dict, Any, List, Optional, Tuple
 from loguru import logger
 
-from src.llm_reasoner import LLMReasoner
+from src.llm_reasoner import LLMReasoner, SemanticValidationResponse, clean_and_validate_json
 
 
 class ValidationEngine:
@@ -140,17 +140,9 @@ Respond ONLY with a JSON object in this format (no markdown code-block wraps):
             logger.info("Requesting LLM semantic audit...")
             response = llm.llm.invoke(prompt)
             
-            # Parse the response
-            cleaned = response.content.strip()
-            if cleaned.startswith("```json"):
-                cleaned = cleaned[7:]
-            if cleaned.startswith("```"):
-                cleaned = cleaned[3:]
-            if cleaned.endswith("```"):
-                cleaned = cleaned[:-3]
-            cleaned = cleaned.strip()
-            
-            data = json.loads(cleaned)
+            # Parse & validate the response with Pydantic
+            parsed_res = clean_and_validate_json(response.content, SemanticValidationResponse)
+            data = parsed_res.model_dump()
             
             # Build error category counts
             slices = data.get("test_slices", [])

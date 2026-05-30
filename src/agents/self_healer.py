@@ -5,7 +5,7 @@ import json
 from typing import Dict, List, Any, Optional
 from loguru import logger
 
-from src.llm_reasoner import LLMReasoner
+from src.llm_reasoner import LLMReasoner, DaxCorrectionResponse, clean_and_validate_json
 
 
 class SelfHealingAgent:
@@ -24,7 +24,8 @@ class SelfHealingAgent:
         failed_dax: str,
         failures: List[Dict[str, Any]],
         attempt_number: int,
-        measure_name: str
+        measure_name: str,
+        schema_context: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Generate corrected DAX based on validation failures.
@@ -58,6 +59,9 @@ We are on self-healing correction attempt {attempt_number} of {self.max_attempts
 - Original ThoughtSpot Formula: `{original_formula}`
 - Current Generated DAX (Failed): `{failed_dax}`
 
+## SCHEMA CONTEXT (Use this to resolve correct column and table names):
+{schema_context or "No schema context provided. Default to '[Column Name]' formatting with standard table 'Table'."}
+
 ## VALIDATION DISCREPANCIES:
 {failure_summary}
 
@@ -72,6 +76,9 @@ Generate a corrected DAX formula that fixes the discrepancy.
 2. Check aggregation: In ThoughtSpot, columns are often aggregated implicitly or explicitly. Ensure DAX aggregates correctly (e.g. `SUM('Table'[Col])`).
 3. Check filter context: If `group_aggregate` was used with a dimension list, ALLEXCEPT or REMOVEFILTERS might be required to lock the aggregation grain.
 4. If there is a scaling issue (e.g. off by 100x), check whether the ThoughtSpot formula expects decimal ratios while DAX does not, or vice versa.
+5. STRICT SCHEMA ADHERENCE: NEVER hallucinate or invent table or column names. You MUST use the exact table and column names provided in the SCHEMA CONTEXT. If the schema specifies that a column is in the 'Sales' table, write `'Sales'[Column]`, NOT `'Revenue'[Column]` or generic names.
+6. MEASURE CONTEXT: Because this corrected DAX formula is a **measure** (not a calculated column), it MUST NOT reference naked table column names directly (e.g., `'Sales'[Revenue]` without aggregation). You MUST wrap all columns in an aggregation function (like `SUM('Table'[Column])`, `AVERAGE('Table'[Column])`, `MAX('Table'[Column])`, etc.) when referencing them in the formula. Do not let the healer remove SUM() to satisfy row-level evaluations. If a row-level condition is needed, wrap it in aggregation functions that compile inside a measure.
+
 
 Respond ONLY with a valid JSON object in the exact format below (no markdown wraps, no explanation outside JSON):
 {{
@@ -87,16 +94,8 @@ Respond ONLY with a valid JSON object in the exact format below (no markdown wra
                 return self._fallback_correction(failed_dax, error_categories, attempt_number)
 
             response = self.llm_reasoner.reason(prompt)
-            cleaned = response.strip()
-            if cleaned.startswith("```json"):
-                cleaned = cleaned[7:]
-            if cleaned.startswith("```"):
-                cleaned = cleaned[3:]
-            if cleaned.endswith("```"):
-                cleaned = cleaned[:-3]
-            cleaned = cleaned.strip()
-
-            data = json.loads(cleaned)
+            parsed_res = clean_and_validate_json(response, DaxCorrectionResponse)
+            data = parsed_res.model_dump()
 
             # Ensure the corrected dax starts with the measure name assignment
             corrected_dax = data.get("corrected_dax", failed_dax)

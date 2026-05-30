@@ -91,9 +91,20 @@ class MigrationOrchestrator:
                 else "Table"
             )
 
+            # Build column metadata dictionary to pass to formula converter
+            column_metadata = {}
+            for table in intermediate_model.get("tables", []):
+                for col in table.get("column_details", []):
+                    column_metadata[col.get("name", "")] = {
+                        "column_type": col.get("column_type"),
+                        "aggregation": col.get("aggregation"),
+                        "data_type": col.get("data_type"),
+                    }
+
             converter = ThoughtSpotFormulaConverter(
                 table_name=default_table,
                 column_table_map=col_table_map,
+                column_metadata=column_metadata,
             )
 
             dax_conversions = []
@@ -134,6 +145,21 @@ class MigrationOrchestrator:
             val_engine = ValidationEngine()
             healer = SelfHealingAgent(max_attempts=3)
 
+            # Build schema context string for the self-healer
+            schema_context_lines = []
+            if default_table:
+                schema_context_lines.append(f"Primary table: '{default_table}'")
+            if col_table_map:
+                schema_context_lines.append("Known column mappings:")
+                for col, tbl in list(col_table_map.items())[:30]:
+                    schema_context_lines.append(f"  - Column '{col}' is in table '{tbl}'")
+            known_measures = [c["measure_name"] for c in dax_conversions]
+            if known_measures:
+                schema_context_lines.append("Known measure references:")
+                for m in known_measures:
+                    schema_context_lines.append(f"  - Measure: [{m}]")
+            schema_str = "\n".join(schema_context_lines)
+
             for idx, conv in enumerate(dax_conversions):
                 c_id = conv["conversion_id"]
                 meas_name = conv["measure_name"]
@@ -153,7 +179,8 @@ class MigrationOrchestrator:
                         failed_dax=curr_dax,
                         failures=val_res.get("test_slices", []),
                         attempt_number=attempt_num,
-                        measure_name=meas_name
+                        measure_name=meas_name,
+                        schema_context=schema_str
                     )
                     save_correction_attempt(self.db_path, migration_id, c_id, attempt)
 

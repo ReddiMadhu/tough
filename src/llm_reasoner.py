@@ -7,8 +7,67 @@ import os
 import json
 from typing import Dict, Any, Optional, List
 from loguru import logger
+from pydantic import BaseModel, Field
 
 from api.config import config
+
+
+class FormulaTranslationResponse(BaseModel):
+    dax_formula: str = Field(description="The translated DAX formula including the measure name, e.g. 'Measure = SUM(...)' or just the expression.")
+    confidence: float = Field(description="Confidence level between 0.0 and 1.0", ge=0.0, le=1.0)
+    pattern: str = Field(description="Pattern identified, e.g. 'AI_TRANSLATION'")
+    notes: List[str] = Field(default_factory=list, description="Implementation notes and assumptions")
+    requires_review: bool = Field(description="Flag to indicate if manual verification is needed")
+
+
+class ModelNarrativeResponse(BaseModel):
+    narrative: str = Field(description="A markdown-formatted summary with Executive Overview, Semantic Architecture, Key Metrics, and Data Governance.")
+
+
+class DaxCorrectionResponse(BaseModel):
+    root_cause: str = Field(description="Detailed explanation of why the current DAX failed validation")
+    corrected_dax: str = Field(description="The corrected DAX formula, e.g., 'Measure = ...'")
+    explanation: str = Field(description="What changes were made and why")
+    changes_made: List[str] = Field(description="List of specific changes made")
+
+
+class MockTestSlice(BaseModel):
+    dimensions: Dict[str, str] = Field(description="Mock dimension slice, e.g. {'Region': 'North'}")
+    tableau_value: Any = Field(description="Mock expected value from ThoughtSpot")
+    source_value: Any = Field(description="Mock expected value from ThoughtSpot (alias)")
+    dax_value: Any = Field(description="Mock value produced by the DAX formula")
+    delta: Optional[float] = Field(None, description="Absolute difference between expected and dax values")
+    relative_error: Optional[float] = Field(None, description="Relative error")
+    passed: bool = Field(description="True if within acceptable epsilon delta")
+    error_category: str = Field(description="Error category, e.g., 'PERFECT_MATCH', 'ROUNDING_ERROR', 'CONTEXT_SHIFT'")
+
+
+
+class SemanticValidationResponse(BaseModel):
+    overall_passed: bool = Field(description="True if the DAX formula matches the ThoughtSpot formula semantically")
+    pass_rate: float = Field(description="Pass rate from 0.0 to 1.0", ge=0.0, le=1.0)
+    error_category: str = Field(description="The primary error category, e.g. 'PERFECT_MATCH', 'AGGREGATION_MISMATCH', etc.")
+    reason: str = Field(description="Explanation of the validation audit findings")
+    test_slices: List[MockTestSlice] = Field(description="Mock test slices for validation verification")
+
+
+
+def clean_and_validate_json(raw_response: str, model_cls: type[BaseModel]) -> BaseModel:
+    """
+    Cleans markdown backticks (like ```json ... ```) from LLM output,
+    parses the JSON, and validates it against the provided Pydantic model.
+    """
+    cleaned = raw_response.strip()
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    elif cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+    cleaned = cleaned.strip()
+    
+    return model_cls.model_validate_json(cleaned)
+
 
 
 class LLMReasoner:
@@ -84,6 +143,8 @@ CONTEXT & RULES:
 5. Support aggregations (`SUM`, `AVERAGE`, `COUNT`, `DISTINCTCOUNT`, `MIN`, `MAX`).
 6. Support conditional statements (`IF`, `SWITCH`).
 7. For cumulative totals, use `CALCULATE(..., FILTER(ALL(...), ...))`.
+8. STRICT SCHEMA ADHERENCE: NEVER hallucinate or invent table names. You MUST use the exact table names provided in the SCHEMA CONTEXT. If the schema specifies that 'revenue' is in the 'Sales' table, write `'Sales'[Revenue]`, NOT `'Revenue'[Revenue]`.
+9. NO GHOST DATE TABLES: For time intelligence functions (like `SAMEPERIODLASTYEAR`), do NOT assume a generic `'Date'[Date]` table exists unless it is provided in the schema context. Use an existing date column from the schema if possible, or add a note if missing.
 
 SCHEMA CONTEXT (Use this to resolve correct column and table names if applicable):
 {schema_context or "No schema context provided. Default to '[Column Name]' formatting with standard table 'Table'."}
@@ -105,7 +166,8 @@ JSON Format:
 
         try:
             response = self.llm.invoke(prompt)
-            result = json.loads(response.content)
+            parsed_res = clean_and_validate_json(response.content, FormulaTranslationResponse)
+            result = parsed_res.model_dump()
             
             # Format correction check
             dax = result.get("dax_formula", "")
@@ -166,8 +228,8 @@ JSON Format:
 
         try:
             response = self.llm.invoke(prompt)
-            result = json.loads(response.content)
-            return result.get("narrative", "")
+            parsed_res = clean_and_validate_json(response.content, ModelNarrativeResponse)
+            return parsed_res.narrative
         except Exception as e:
             logger.error(f"LLM narrative generation failed: {e}")
             return None
