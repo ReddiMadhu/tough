@@ -242,8 +242,15 @@ class UpdateConversionRequest(BaseModel):
 def _get_intermediate_model(migration_id: str) -> Optional[dict]:
     import json
     from pathlib import Path
-    path = Path(config.EXPORT_DIR) / migration_id / f"model_{migration_id}.json"
-    if not path.exists():
+    base = Path(config.EXPORT_DIR) / migration_id
+    # Try the actual output filename first, then fall back to legacy name
+    candidates = [
+        base / f"{migration_id}_intermediate_model.json",
+        base / f"model_{migration_id}.json",
+    ]
+    path = next((p for p in candidates if p.exists()), None)
+    if not path:
+        logger.warning(f"No intermediate model file found for {migration_id} in {base}")
         return None
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -270,12 +277,38 @@ async def get_workbook_metadata(migration_id: str):
         "total_calculated_fields": len(formula_cols),
     }
 
+    # Build a quick lookup: internal_name → caption for all formula columns
+    calc_name_map = {
+        c.get("internal_name", ""): c.get("caption", c.get("internal_name", ""))
+        for c in model.get("columns", [])
+        if c.get("formula")
+    }
+
+    def _strip_brackets(field_ref: str) -> str:
+        """Convert '[Field Name]' → 'Field Name', leave plain names alone."""
+        s = field_ref.strip()
+        if s.startswith("[") and s.endswith("]"):
+            return s[1:-1]
+        return s
+
     worksheets = []
     for ws in model.get("worksheets", []):
+        # rows = Y-axis (typically measures), cols = X-axis (typically dimensions)
+        raw_rows = ws.get("rows", [])
+        raw_cols = ws.get("cols", [])
+
+        measures_list = [{"name": _strip_brackets(r), "type": "calculated"} for r in raw_rows]
+        dimensions_list = [_strip_brackets(c) for c in raw_cols]
+
         worksheets.append({
             "name": ws.get("name", ""),
-            "measures": [{"name": c, "type": "calculated"} for c in ws.get("formulas", [])],
-            "dimensions": ws.get("columns", [])
+            "ts_chart_type": ws.get("ts_chart_type", ""),
+            "mark_type": ws.get("mark_type", ""),
+            "source_liveboard": ws.get("source_liveboard", ""),
+            "rows": raw_rows,
+            "cols": raw_cols,
+            "measures": measures_list,
+            "dimensions": dimensions_list,
         })
 
     calcs = []
@@ -286,8 +319,9 @@ async def get_workbook_metadata(migration_id: str):
                 "name": c.get("caption", c.get("internal_name", "")),
                 "caption": c.get("caption", c.get("internal_name", "")),
                 "formula": c.get("formula", ""),
-                "role": "measure" if c.get("column_type") == "MEASURE" else "dimension",
-                "datatype": c.get("data_type", "string").lower()
+                # model JSON uses 'role' field; column_details use 'column_type'
+                "role": c.get("role") or ("measure" if c.get("column_type") == "MEASURE" else "dimension"),
+                "datatype": (c.get("datatype") or c.get("data_type") or "string").lower()
             })
 
     tables = []
@@ -446,61 +480,6 @@ async def get_migration_calculations(migration_id: str):
     return {"calculations": calcs}
 
 
-@router.get("/{migration_id}/validation-results")
-async def get_migration_validation_results(migration_id: str):
-    """Get validation results list and summary."""
-    from storage.fidelity_validation_store import get_validation_results
-    res = get_validation_results(config.DATABASE_PATH, migration_id)
-    
-    total = len(res)
-    passed = sum(1 for r in res if r.get("overall_passed"))
-    failed = total - passed
-    pass_rate = (passed / total) * 100 if total > 0 else 100.0
-
-    return {
-        "results": res,
-        "summary": {
-            "total_conversions": total,
-            "passed": passed,
-            "failed": failed,
-            "pass_rate": pass_rate
-        }
-    }
-
-
-@router.get("/{migration_id}/fidelity-validation")
-async def get_fidelity_validation(migration_id: str):
-    """Get unified discrepancy inspector validation slices."""
-    from storage.fidelity_validation_store import get_validation_results, get_correction_history
-    results = get_validation_results(config.DATABASE_PATH, migration_id)
-    attempts = get_correction_history(config.DATABASE_PATH, migration_id)
-
-    slices = []
-    overall_passed = True
-    passed_count = 0
-    for r in results:
-        slices.extend(r.get("test_results", []))
-        overall_passed = overall_passed and r.get("overall_passed", False)
-        if r.get("overall_passed", False):
-            passed_count += 1
-
-    total = len(results)
-    pass_rate = (passed_count / total) if total > 0 else 1.0
-
-    return {
-        "overall_passed": overall_passed,
-        "pass_rate": pass_rate,
-        "test_slices": slices,
-        "correction_attempts": len(attempts)
-    }
-
-
-@router.get("/{migration_id}/correction-history")
-async def get_migration_correction_history(migration_id: str):
-    """Get self-healing correction attempts timeline."""
-    from storage.fidelity_validation_store import get_correction_history
-    attempts = get_correction_history(config.DATABASE_PATH, migration_id)
-    return {"correction_attempts": attempts}
 
 
 @router.get("/{migration_id}/filters")
@@ -522,96 +501,6 @@ async def get_migration_filters(migration_id: str):
     return {"filters": filters}
 
 
-@router.post("/{migration_id}/validate")
-async def trigger_migration_revalidation(migration_id: str):
-    """Trigger manual syntax/semantic validation on all formulas."""
-    from src.validation.validation_engine import ValidationEngine
-    from storage.fidelity_validation_store import save_validation_result
-
-    conversions = get_migration_conversions(config.DATABASE_PATH, migration_id)
-    val_engine = ValidationEngine()
-
-    for conv in conversions:
-        c_id = conv["conversion_id"]
-        meas_name = conv["measure_name"]
-        orig_f = conv["original_formula"]
-        curr_d = conv["dax_formula"]
-        conf = conv["confidence"]
-
-        val_res = val_engine.validate(c_id, orig_f, curr_d, meas_name, conf, migration_id)
-        save_validation_result(config.DATABASE_PATH, migration_id, c_id, val_res)
-
-    return {"status": "success", "message": "Re-validation completed"}
-
-
-@router.patch("/{migration_id}/conversions/{conversion_id}")
-async def patch_conversion(migration_id: str, conversion_id: str, body: UpdateConversionRequest):
-    """Manually override a DAX formula and re-validate it immediately."""
-    from storage.migration_store import update_conversion_dax
-    from src.validation.validation_engine import ValidationEngine
-    from storage.fidelity_validation_store import save_validation_result
-
-    update_conversion_dax(config.DATABASE_PATH, conversion_id, body.dax_formula, body.reasoning or "")
-
-    # Re-validate
-    conversions = get_migration_conversions(config.DATABASE_PATH, migration_id)
-    conv = next((c for c in conversions if c["conversion_id"] == conversion_id), None)
-    if conv:
-        val_engine = ValidationEngine()
-        val_res = val_engine.validate(
-            conversion_id, 
-            conv["original_formula"], 
-            body.dax_formula, 
-            conv["measure_name"], 
-            conv["confidence"], 
-            migration_id
-        )
-        save_validation_result(config.DATABASE_PATH, migration_id, conversion_id, val_res)
-
-    return {"status": "success", "message": "DAX updated and re-validated"}
-
-
-@router.get("/{migration_id}/model-enhancements")
-async def get_migration_model_enhancements(migration_id: str):
-    """Retrieve Power BI schema model recommendations."""
-    from storage.fidelity_validation_store import get_model_enhancements
-    enhancements = get_model_enhancements(config.DATABASE_PATH, migration_id)
-    return {
-        "requires_enhancement": len(enhancements) > 0,
-        "enhancements": enhancements
-    }
-
-
-@router.get("/{migration_id}/recommendations")
-async def get_migration_recommendations(migration_id: str):
-    """Retrieve AI executive narrative and best practice suggestions."""
-    row = get_migration(config.DATABASE_PATH, migration_id)
-    summary = row["narrative_summary"] if row else ""
-
-    return {
-        "migration_id": migration_id,
-        "recommendations": [
-            {
-                "category": "Data Model",
-                "title": "Use dedicated Date table",
-                "description": "Create a centralized date dimension table to unlock Power BI time-intelligence features and ensure correct sorting.",
-                "priority": "HIGH"
-            },
-            {
-                "category": "DAX Formulas",
-                "title": "DIVIDE safe division check",
-                "description": "Double check all division calculations to ensure they use DIVIDE() instead of / to gracefully handle empty values.",
-                "priority": "HIGH"
-            },
-            {
-                "category": "Performance",
-                "title": "Optimize visual level grouping",
-                "description": "For query_groups() replacements, prefer calculated columns or helper tables over complex measures to speed up visual rendering.",
-                "priority": "MEDIUM"
-            }
-        ],
-        "model_summary": summary
-    }
 
 
 from fastapi.responses import StreamingResponse

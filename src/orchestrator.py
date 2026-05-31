@@ -246,23 +246,8 @@ class MigrationOrchestrator:
             _progress("exporting", 75, "Generating Excel + DAX + JSON exports...")
             logger.info(f"[{migration_id}] Phase 5: Generating Excel + DAX + JSON...")
             
-            # Generate AI Narrative Summary if LLM is enabled
+            # AI Narrative Summary removed (LLM cost saving)
             narrative_summary = None
-            try:
-                from src.llm_reasoner import LLMReasoner
-                llm = LLMReasoner()
-                if llm.llm:
-                    logger.info(f"[{migration_id}] Generating AI Executive Narrative...")
-                    narrative_summary = llm.generate_model_narrative(
-                        tables=intermediate_model.get("tables", []),
-                        relationships=intermediate_model.get("joins", []),
-                        conversions=dax_conversions,
-                    )
-            except Exception as e:
-                logger.error(f"[{migration_id}] AI Narrative Generation skipped: {e}")
-
-            if narrative_summary:
-                intermediate_model["narrative_summary"] = narrative_summary
 
             excel_gen = ExcelReportGenerator()
             excel_path = excel_gen.generate(
