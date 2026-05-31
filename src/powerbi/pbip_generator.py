@@ -237,12 +237,27 @@ class PBIPGenerator:
 
         for i, join in enumerate(joins):
             card = join.get("cardinality", "many-to-one").lower().replace("_", "-")
+            
+            left_table = join['left_table']
+            left_col = self._clean_column_name(join.get("left_column", ""))
+            right_table = join['right_table']
+            right_col = self._clean_column_name(join.get("right_column", ""))
+
+            # Skip relationships with empty column references
+            if not left_col or not right_col:
+                logger.warning(f"Skipping relationship: missing column references")
+                continue
+
             if card in ("one-to-one",):
                 from_card, to_card = "one", "one"
             elif card in ("many-to-many",):
                 from_card, to_card = "many", "many"
             elif card in ("one-to-many",):
-                from_card, to_card = "one", "many"
+                # Power BI requires the from-cardinality of a relationship to be 'many' (except for one-to-one).
+                # We flip the from and to ends to represent this as a many-to-one relationship.
+                from_card, to_card = "many", "one"
+                left_table, right_table = right_table, left_table
+                left_col, right_col = right_col, left_col
             else:  # many-to-one (default)
                 from_card, to_card = "many", "one"
 
@@ -251,22 +266,14 @@ class PBIPGenerator:
             rel_name = join.get("name") or f"rel_{i + 1}"
             rel_name = re.sub(r"[^\w]", "_", rel_name)
 
-            left_col = self._clean_column_name(join.get("left_column", ""))
-            right_col = self._clean_column_name(join.get("right_column", ""))
-
-            # Skip relationships with empty column references
-            if not left_col or not right_col:
-                logger.warning(f"Skipping relationship '{rel_name}': missing column references")
-                continue
-
             # Separate relationships with a blank line (but not before the first one)
             if lines:
                 lines.append("")
 
             lines.append(f"relationship {rel_name}")
-            lines.append(f"    fromColumn: '{join['left_table']}'.'{left_col}'")
+            lines.append(f"    fromColumn: '{left_table}'.'{left_col}'")
             lines.append(f"    fromCardinality: {from_card}")
-            lines.append(f"    toColumn: '{join['right_table']}'.'{right_col}'")
+            lines.append(f"    toColumn: '{right_table}'.'{right_col}'")
             lines.append(f"    toCardinality: {to_card}")
             lines.append(f"    crossFilteringBehavior: {cross_filter}")
             lines.append(f"    isActive: true")

@@ -97,8 +97,10 @@ class TMLParser:
 
         # Build table alias → name map
         table_refs: Dict[str, str] = {}
-        for t in model_data.get("tables", []):
-            table_refs[t.get("id", "")] = t.get("name", "")
+        tables_list = model_data.get("tables") or model_data.get("model_tables", [])
+        for t in tables_list:
+            table_id = t.get("id") or t.get("name", "")
+            table_refs[table_id] = t.get("name", "")
 
         # Formulas (calculated fields)
         for formula in model_data.get("formulas", []):
@@ -175,6 +177,22 @@ class TMLParser:
                 "cardinality": join.get("cardinality", "MANY_TO_ONE"),
             })
 
+        for t in model_data.get("model_tables", []):
+            src_table = t.get("name", "")
+            for join in t.get("joins", []):
+                dst_table = join.get("with", "")
+                on_clause = join.get("on") or join.get(True) or ""
+                left_col, right_col = self._parse_on_clause(on_clause)
+                self.joins.append({
+                    "name": join.get("name", f"{src_table}_{dst_table}_join"),
+                    "left_table": src_table,
+                    "left_column": left_col,
+                    "right_table": dst_table,
+                    "right_column": right_col,
+                    "join_type": join.get("type", "LEFT_OUTER"),
+                    "cardinality": join.get("cardinality", "MANY_TO_ONE"),
+                })
+
         # Model-level filters
         for f in model_data.get("filters", []):
             self.filters.append({
@@ -194,12 +212,24 @@ class TMLParser:
             answer = viz.get("answer", {})
             chart = answer.get("chart", {})
 
+            axis_map = {}
+            for config in chart.get("axis_configs", []):
+                for axis_name, col_ids in config.items():
+                    if isinstance(col_ids, list):
+                        for cid in col_ids:
+                            axis_map[cid] = axis_name.upper()
+                    elif isinstance(col_ids, str):
+                        axis_map[col_ids] = axis_name.upper()
+
             rows, cols_list = [], []
             for chart_col in chart.get("chart_columns", []):
-                col_info = chart_col.get("column", {})
+                col_name = chart_col.get("column_id") or chart_col.get("column", {}).get("name", "")
+                if not col_name:
+                    continue
                 axis = chart_col.get("axis", "")
-                col_name = col_info.get("name", "")
-                if axis in ("Y_AXIS", "Y_AXIS_2"):
+                if not axis and col_name in axis_map:
+                    axis = axis_map[col_name]
+                if axis in ("Y_AXIS", "Y_AXIS_2", "Y", "Y2", "SIZE"):
                     rows.append(col_name)
                 else:
                     cols_list.append(col_name)
@@ -243,12 +273,24 @@ class TMLParser:
         chart = answer_data.get("chart", {})
         answer_name = answer_data.get("name", "")
 
+        axis_map = {}
+        for config in chart.get("axis_configs", []):
+            for axis_name, col_ids in config.items():
+                if isinstance(col_ids, list):
+                    for cid in col_ids:
+                        axis_map[cid] = axis_name.upper()
+                elif isinstance(col_ids, str):
+                    axis_map[col_ids] = axis_name.upper()
+
         rows, cols_list = [], []
         for chart_col in chart.get("chart_columns", []):
-            col_info = chart_col.get("column", {})
+            col_name = chart_col.get("column_id") or chart_col.get("column", {}).get("name", "")
+            if not col_name:
+                continue
             axis = chart_col.get("axis", "")
-            col_name = col_info.get("name", "")
-            if axis in ("Y_AXIS",):
+            if not axis and col_name in axis_map:
+                axis = axis_map[col_name]
+            if axis in ("Y_AXIS", "Y_AXIS_2", "Y", "Y2", "SIZE"):
                 rows.append(col_name)
             else:
                 cols_list.append(col_name)
