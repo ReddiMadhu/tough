@@ -160,6 +160,10 @@ class ThoughtSpotFormulaConverter:
 
     def _resolve_col_name_only(self, col_name: str) -> Optional[str]:
         """Resolve a single column/measure name to its DAX reference format."""
+        col_name = col_name.strip().strip("[]")
+        if "::" in col_name:
+            col_name = col_name.split("::")[-1].strip().strip("[]")
+            
         norm = self._normalize_identifier(col_name)
         
         # Check known measures first
@@ -208,7 +212,8 @@ class ThoughtSpotFormulaConverter:
             if lower_token in (
                 "if", "then", "else", "and", "or", "not", "true", "false", "null", "blank",
                 "sum", "average", "avg", "count", "unique_count", "min", "max", "group_sum",
-                "group_count", "group_average", "group_aggregate", "cumulative_sum"
+                "group_count", "group_average", "group_aggregate", "cumulative_sum",
+                "calculate", "distinctcount", "removefilters", "divide"
             ):
                 return token
                 
@@ -236,9 +241,19 @@ class ThoughtSpotFormulaConverter:
     def _resolve_col(self, col: str) -> str:
         """Resolve column name to DAX 'Table'[Column] format."""
         col = col.strip().strip("'\"")
+        
+        # Strip outer brackets if present: [col] -> col
+        if col.startswith("[") and col.endswith("]"):
+            col = col[1:-1].strip()
+            
+        # Handle 'Table::Column' or 'Table::[Column]' format
+        if "::" in col:
+            col = col.split("::")[-1].strip().strip("[]")
+            
         resolved = self._resolve_col_name_only(col)
         if resolved:
             return resolved
+            
         # Fallback if not found in mapping
         sanitized = self._sanitize_name(col)
         table = self.col_table_map.get(col, self.default_table)
@@ -590,11 +605,15 @@ class ThoughtSpotFormulaConverter:
         return None
 
     def _try_arithmetic(self, formula: str, name: str) -> Optional[DAXResult]:
-        # Safe division
-        div_m = re.match(r"^(.+?)\s*/\s*(.+)$", formula.strip())
-        if div_m:
-            num = self._convert_expr(div_m.group(1).strip(), wrap_bare_columns=True)
-            den = self._convert_expr(div_m.group(2).strip(), wrap_bare_columns=True)
+        # Pre-translate complex functions first
+        formula_pre = self._translate_complex_functions(formula)
+        
+        # Check safe division first using top-level split
+        split_res = self._find_top_level_split(formula_pre, "/")
+        if split_res:
+            num_part, den_part = split_res
+            num = self._convert_expr(num_part, wrap_bare_columns=True)
+            den = self._convert_expr(den_part, wrap_bare_columns=True)
             return DAXResult(
                 original_formula=formula,
                 dax_formula=f"{name} = DIVIDE({num}, {den}, 0)",
@@ -603,17 +622,22 @@ class ThoughtSpotFormulaConverter:
                 pattern="ARITHMETIC",
                 notes=["Division → DIVIDE() for safe division-by-zero handling"],
             )
-        # General arithmetic
-        if re.search(r"[+\-*]", formula):
-            dax_expr = self._convert_expr(formula, wrap_bare_columns=True)
-            return DAXResult(
-                original_formula=formula,
-                dax_formula=f"{name} = {dax_expr}",
-                measure_name=name,
-                confidence=0.80,
-                pattern="ARITHMETIC",
-                notes=["Arithmetic expression converted"],
-            )
+            
+        # General arithmetic: check top-level +, - or *
+        for op in ("+", "-", "*"):
+            split_res = self._find_top_level_split(formula_pre, op)
+            if split_res:
+                left_part, right_part = split_res
+                left = self._convert_expr(left_part, wrap_bare_columns=True)
+                right = self._convert_expr(right_part, wrap_bare_columns=True)
+                return DAXResult(
+                    original_formula=formula,
+                    dax_formula=f"{name} = {left} {op} {right}",
+                    measure_name=name,
+                    confidence=0.80,
+                    pattern="ARITHMETIC",
+                    notes=["Arithmetic expression converted"],
+                )
         return None
 
     def _try_cumulative(self, formula: str, name: str) -> Optional[DAXResult]:
@@ -682,14 +706,154 @@ class ThoughtSpotFormulaConverter:
         )
 
 
+    def _find_top_level_split(self, formula: str, op: str) -> Optional[Tuple[str, str]]:
+        """Find a top-level split for a binary operator respecting parentheses."""
+        depth = 0
+        for i, ch in enumerate(formula):
+            if ch in ("(", "{", "["):
+                depth += 1
+            elif ch in (")", "}", "]"):
+                depth -= 1
+            elif ch == op and depth == 0:
+                return formula[:i].strip(), formula[i+1:].strip()
+        return None
+
+    def _convert_expr_conditions(self, cond_str: str) -> str:
+        """Convert ThoughtSpot condition expression (with and/or) to DAX format."""
+        resolved = self._resolve_expr_identifiers(cond_str, wrap_bare_columns=False)
+        resolved = re.sub(r"\band\b", "&&", resolved, flags=re.IGNORECASE)
+        resolved = re.sub(r"\bor\b", "||", resolved, flags=re.IGNORECASE)
+        resolved = re.sub(r"\bnot\b", "!", resolved, flags=re.IGNORECASE)
+        resolved = resolved.replace("!=", "<>")
+        return resolved
+
+    def _translate_complex_functions(self, expr: str) -> str:
+        """Recursively translate nested ThoughtSpot complex functions to standard DAX."""
+        prev = ""
+        while expr != prev:
+            prev = expr
+            
+            # unique_count_if(cond, col)
+            match_uci = re.search(r"\bunique_count_if\s*\(\s*([^,\(\)]+)\s*,\s*([^,\(\)]+)\s*\)", expr, re.IGNORECASE)
+            if match_uci:
+                full_term = match_uci.group(0)
+                cond = match_uci.group(1).strip()
+                col = match_uci.group(2).strip()
+                cond_dax = self._convert_expr_conditions(cond)
+                resolved_col = self._resolve_col(col)
+                table, _ = self._get_table_and_col(col)
+                if "&&" in cond_dax or "||" in cond_dax:
+                    dax_replacement = f"CALCULATE(DISTINCTCOUNT({resolved_col}), FILTER('{table}', {cond_dax}))"
+                else:
+                    dax_replacement = f"CALCULATE(DISTINCTCOUNT({resolved_col}), {cond_dax})"
+                expr = expr.replace(full_term, dax_replacement)
+                continue
+                
+            # group_unique_count(col)
+            match_guc = re.search(r"\bgroup_unique_count\s*\(\s*([^,\(\)]+)\s*\)", expr, re.IGNORECASE)
+            if match_guc:
+                full_term = match_guc.group(0)
+                col = match_guc.group(1).strip()
+                resolved_col = self._resolve_col(col)
+                table, _ = self._get_table_and_col(col)
+                dax_replacement = f"CALCULATE(DISTINCTCOUNT({resolved_col}), REMOVEFILTERS('{table}'))"
+                expr = expr.replace(full_term, dax_replacement)
+                continue
+                
+            # unique_count(col) or unique count(col)
+            match_uc = re.search(r"\b(?:unique_count|unique\s+count)\s*\(\s*([^,\(\)]+)\s*\)", expr, re.IGNORECASE)
+            if match_uc:
+                full_term = match_uc.group(0)
+                col = match_uc.group(1).strip()
+                resolved_col = self._resolve_col(col)
+                dax_replacement = f"DISTINCTCOUNT({resolved_col})"
+                expr = expr.replace(full_term, dax_replacement)
+                continue
+
+            # sum_if(cond, col)
+            match_si = re.search(r"\bsum_if\s*\(\s*([^,\(\)]+)\s*,\s*([^,\(\)]+)\s*\)", expr, re.IGNORECASE)
+            if match_si:
+                full_term = match_si.group(0)
+                cond = match_si.group(1).strip()
+                col = match_si.group(2).strip()
+                cond_dax = self._convert_expr_conditions(cond)
+                resolved_col = self._resolve_col(col)
+                table, _ = self._get_table_and_col(col)
+                if "&&" in cond_dax or "||" in cond_dax:
+                    dax_replacement = f"CALCULATE(SUM({resolved_col}), FILTER('{table}', {cond_dax}))"
+                else:
+                    dax_replacement = f"CALCULATE(SUM({resolved_col}), {cond_dax})"
+                expr = expr.replace(full_term, dax_replacement)
+                continue
+
+            # count_if(cond, col)
+            match_ci = re.search(r"\bcount_if\s*\(\s*([^,\(\)]+)\s*,\s*([^,\(\)]+)\s*\)", expr, re.IGNORECASE)
+            if match_ci:
+                full_term = match_ci.group(0)
+                cond = match_ci.group(1).strip()
+                col = match_ci.group(2).strip()
+                cond_dax = self._convert_expr_conditions(cond)
+                resolved_col = self._resolve_col(col)
+                table, _ = self._get_table_and_col(col)
+                if "&&" in cond_dax or "||" in cond_dax:
+                    dax_replacement = f"CALCULATE(COUNT({resolved_col}), FILTER('{table}', {cond_dax}))"
+                else:
+                    dax_replacement = f"CALCULATE(COUNT({resolved_col}), {cond_dax})"
+                expr = expr.replace(full_term, dax_replacement)
+                continue
+
+            # average_if(cond, col)
+            match_ai = re.search(r"\baverage_if\s*\(\s*([^,\(\)]+)\s*,\s*([^,\(\)]+)\s*\)", expr, re.IGNORECASE)
+            if match_ai:
+                full_term = match_ai.group(0)
+                cond = match_ai.group(1).strip()
+                col = match_ai.group(2).strip()
+                cond_dax = self._convert_expr_conditions(cond)
+                resolved_col = self._resolve_col(col)
+                table, _ = self._get_table_and_col(col)
+                if "&&" in cond_dax or "||" in cond_dax:
+                    dax_replacement = f"CALCULATE(AVERAGE({resolved_col}), FILTER('{table}', {cond_dax}))"
+                else:
+                    dax_replacement = f"CALCULATE(AVERAGE({resolved_col}), {cond_dax})"
+                expr = expr.replace(full_term, dax_replacement)
+                continue
+                
+        return expr
+
     # ── Expression helpers ─────────────────────────────────────────────────────
 
     def _convert_expr(self, expr: str, wrap_bare_columns: bool = False) -> str:
         """Convert a sub-expression."""
-        expr = expr.strip().strip("()")
+        expr = expr.strip()
+        
+        # Safely strip outer matching parentheses only (e.g. (a+b) -> a+b)
+        if expr.startswith("(") and expr.endswith(")"):
+            depth = 0
+            balanced = True
+            for ch in expr[:-1]:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        balanced = False
+                        break
+            if balanced:
+                expr = expr[1:-1].strip()
+        
+        # Pre-translate complex functions inside sub-expressions first
+        translated_expr = self._translate_complex_functions(expr)
+        
+        # If pre-translation successfully modified the expression, or if the expression is already 
+        # a translated DAX function, return it immediately to prevent double-resolution!
+        if (translated_expr != expr or 
+            any(k in translated_expr for k in ("CALCULATE(", "DISTINCTCOUNT(", "REMOVEFILTERS(", "SUM(", "COUNT(", "AVERAGE(", "DIVIDE(", "IF(", "ISBLANK("))):
+            return translated_expr
+            
+        expr = translated_expr
         
         # Check if it is a simple aggregation
-        agg_m = re.match(r"^(sum|average|avg|count|min|max)\s*\(\s*([^)]+)\s*\)$", expr, re.IGNORECASE)
+        agg_m = re.match(r"^(sum|average|avg|count|min|max|distinctcount)\s*\(\s*([^)]+)\s*\)$", expr, re.IGNORECASE)
         if agg_m:
             func = agg_m.group(1).upper()
             if func == "AVG":

@@ -186,8 +186,8 @@ class DataModelAgent:
             # Emit node events
             for i, node in enumerate(nodes):
                 emitter.emit("node_added", sub_phase="Building graph nodes", progress=15 + int((i + 1) / max(len(nodes), 1) * 25),
-                             data={"node_name": node.get("name", ""), "node_type": node.get("type", "")},
-                             message=f"Node: {node.get('name', '')}")
+                             data={"node_name": node.get("calc_name", ""), "node_type": node.get("calc_type", "")},
+                             message=f"Node: {node.get('calc_name', '')}")
 
             # Export ReactFlow data
             reactflow_data = builder.export_for_reactflow()
