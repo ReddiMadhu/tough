@@ -171,9 +171,37 @@ class MigrationOrchestrator:
                 val_res = val_engine.validate(c_id, orig_f, curr_dax, meas_name, conf, migration_id)
                 save_validation_result(self.db_path, migration_id, c_id, val_res)
 
+                # ── Temporary Debug Logging for Diagnostics (Initial validation) ──
+                debug_log_paths = [
+                    Path(self.export_dir) / migration_id / "dax_healing_debug.log",
+                    Path(self.export_dir).resolve().parent / "dax_healing_debug.log"
+                ]
+                for p in debug_log_paths:
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    with open(p, "a", encoding="utf-8") as debug_file:
+                        debug_file.write(f"\n{'='*80}\n")
+                        debug_file.write(f"MIGRATION ID                  : {migration_id}\n")
+                        debug_file.write(f"MEASURE NAME                  : {meas_name}\n")
+                        debug_file.write(f"ORIGINAL THOUGHTSPOT FORMULA  :\n{orig_f}\n\n")
+                        debug_file.write(f"INITIAL TRANSLATED DAX        :\n{curr_dax}\n\n")
+                        debug_file.write(f"INITIAL VALIDATION RESULT     :\n")
+                        debug_file.write(f"  Passed                      : {val_res.get('overall_passed')}\n")
+                        debug_file.write(f"  Pass Rate                   : {val_res.get('pass_rate')}\n")
+                        debug_file.write(f"  Validation Discrepancies    :\n{json.dumps(val_res.get('test_slices', []), indent=2)}\n")
+                        debug_file.write(f"{'='*80}\n")
+
                 # 2. Self-healing loop if failed
                 attempt_num = 1
                 while not val_res.get("overall_passed") and attempt_num <= 3:
+                    for p in debug_log_paths:
+                        with open(p, "a", encoding="utf-8") as debug_file:
+                            debug_file.write(f"\n{'='*80}\n")
+                            debug_file.write(f"MIGRATION ID                  : {migration_id}\n")
+                            debug_file.write(f"MEASURE NAME                  : {meas_name}\n")
+                            debug_file.write(f"HEALING CYCLE                 : Attempt {attempt_num} / 3\n")
+                            debug_file.write(f"INPUT FAILED DAX FORMULA      :\n{curr_dax}\n\n")
+                            debug_file.write(f"INPUT VALIDATION FAILURES     :\n{json.dumps(val_res.get('test_slices', []), indent=2)}\n\n")
+
                     attempt = healer.correct_dax(
                         original_formula=orig_f,
                         failed_dax=curr_dax,
@@ -188,6 +216,19 @@ class MigrationOrchestrator:
                     curr_dax = attempt["corrected_dax"]
                     val_res = val_engine.validate(c_id, orig_f, curr_dax, meas_name, conf, migration_id)
                     save_validation_result(self.db_path, migration_id, c_id, val_res)
+
+                    for p in debug_log_paths:
+                        with open(p, "a", encoding="utf-8") as debug_file:
+                            debug_file.write(f"HEALER LLM DIAGNOSIS          :\n")
+                            debug_file.write(f"  Root Cause   : {attempt.get('root_cause')}\n")
+                            debug_file.write(f"  Explanation  : {attempt.get('explanation')}\n")
+                            debug_file.write(f"  Changes Made : {attempt.get('changes_made')}\n\n")
+                            debug_file.write(f"OUTPUT HEALED DAX FORMULA     :\n{curr_dax}\n\n")
+                            debug_file.write(f"POST-HEALING VALIDATION STATE :\n")
+                            debug_file.write(f"  Passed       : {val_res.get('overall_passed')}\n")
+                            debug_file.write(f"  Pass Rate    : {val_res.get('pass_rate')}\n")
+                            debug_file.write(f"  Failures Left: {json.dumps(val_res.get('test_slices', []), indent=2)}\n")
+                            debug_file.write(f"{'='*80}\n")
 
                     attempt_num += 1
 

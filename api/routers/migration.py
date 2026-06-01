@@ -91,17 +91,18 @@ async def upload_files(
         file_count=len(files),
     )
 
-    # Start background job
-    background_tasks.add_task(_run_migration, migration_id, file_paths)
+    # NOTE: Agent 1 (Source Analysis) is triggered separately by the frontend
+    # via POST /agents/source-analysis/start after redirect to wizard.
 
-    logger.info(f"Migration {migration_id} queued with {len(files)} file(s)")
+    logger.info(f"Migration {migration_id} created with {len(files)} file(s). Awaiting agent trigger.")
 
     return {
         "migration_id": migration_id,
         "status": "processing",
         "file_count": len(files),
-        "message": f"Uploaded {len(files)} file(s). Migration started.",
+        "message": f"Uploaded {len(files)} file(s). Ready for agent execution.",
     }
+
 
 
 # ── Status ─────────────────────────────────────────────────────────────────────
@@ -149,10 +150,11 @@ async def get_conversions(migration_id: str):
     row = get_migration(config.DATABASE_PATH, migration_id)
     if not row:
         raise HTTPException(status_code=404, detail="Migration not found")
-    if row["status"] == "processing":
+        
+    conversions = get_migration_conversions(config.DATABASE_PATH, migration_id)
+    if not conversions and row["status"] == "processing":
         return JSONResponse(status_code=202, content={"detail": "Migration still in progress"})
 
-    conversions = get_migration_conversions(config.DATABASE_PATH, migration_id)
     return {"migration_id": migration_id, "conversions": conversions}
 
 
@@ -183,7 +185,7 @@ async def download_output(
     row = get_migration(config.DATABASE_PATH, migration_id)
     if not row:
         raise HTTPException(status_code=404, detail="Migration not found")
-    if row["status"] != "completed":
+    if file != "json" and row["status"] != "completed":
         raise HTTPException(status_code=202, detail="Migration not yet complete")
 
     MEDIA_TYPES = {
@@ -480,8 +482,6 @@ async def get_migration_calculations(migration_id: str):
     return {"calculations": calcs}
 
 
-
-
 @router.get("/{migration_id}/filters")
 async def get_migration_filters(migration_id: str):
     """Retrieve filters defined in ThoughtSpot worksheets/models."""
@@ -501,9 +501,44 @@ async def get_migration_filters(migration_id: str):
     return {"filters": filters}
 
 
+@router.get("/{migration_id}/model-enhancements")
+async def get_model_enhancements_endpoint(migration_id: str):
+    """Retrieve all detected model enhancements from database."""
+    from storage.fidelity_validation_store import get_model_enhancements
+    try:
+        enhancements = get_model_enhancements(config.DATABASE_PATH, migration_id)
+        return {
+            "has_enhancements": len(enhancements) > 0,
+            "enhancement_count": len(enhancements),
+            "enhancements": enhancements
+        }
+    except Exception as e:
+        logger.error(f"Failed to get model enhancements: {e}")
+        return {"has_enhancements": False, "enhancement_count": 0, "enhancements": []}
+
+
+@router.get("/{migration_id}/model-enhancements/download")
+async def download_enhancement_guide(migration_id: str):
+    """Download the MODEL_ENHANCEMENTS_REQUIRED.md markdown guide."""
+    from fastapi.responses import FileResponse
+    path = Path(config.EXPORT_DIR) / migration_id / "MODEL_ENHANCEMENTS_REQUIRED.md"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Model enhancement guide not found.")
+    return FileResponse(
+        path=str(path),
+        media_type="text/markdown",
+        filename="MODEL_ENHANCEMENTS_REQUIRED.md"
+    )
+
+
+@router.get("/{migration_id}/model-enhancements/download-all")
+async def download_all_enhancements(migration_id: str):
+    """Fallback to download the main migration package containing enhancements."""
+    return await download_output(migration_id, file="all")
 
 
 from fastapi.responses import StreamingResponse
+
 
 @router.get("/{migration_id}/progress-stream")
 async def progress_stream(migration_id: str):
@@ -547,3 +582,139 @@ async def progress_stream(migration_id: str):
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Multi-Agent Endpoints — 4 trigger + 4 SSE stream
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_VALID_AGENTS = ("source-analysis", "data-model", "dax-conversion", "export")
+_AGENT_NAME_MAP = {
+    "source-analysis": "source_analysis",
+    "data-model": "data_model",
+    "dax-conversion": "dax_conversion",
+    "export": "export",
+}
+
+# Track running agents: (migration_id, agent_name) -> thread status
+_running_agents: Dict[str, str] = {}
+
+
+def _run_agent_background(migration_id: str, agent_slug: str):
+    """Run a specific agent in a background thread."""
+    agent_name = _AGENT_NAME_MAP[agent_slug]
+    agent_key = f"{migration_id}:{agent_name}"
+
+    from src.agents.agent_event_emitter import AgentEventEmitter
+    from src.agents.agent_executor import (
+        SourceAnalysisAgent, DataModelAgent, DaxConversionAgent, ExportAgent
+    )
+
+    emitter = AgentEventEmitter(migration_id, agent_name)
+
+    try:
+        _running_agents[agent_key] = "running"
+
+        if agent_name == "source_analysis":
+            # Find uploaded files
+            upload_dir = _file_store.upload_dir(migration_id)
+            file_paths = [str(p) for p in upload_dir.iterdir() if p.is_file()]
+            agent = SourceAnalysisAgent(config.DATABASE_PATH, config.EXPORT_DIR)
+            agent.run(migration_id, file_paths, emitter)
+
+        elif agent_name == "data_model":
+            agent = DataModelAgent(config.DATABASE_PATH, config.EXPORT_DIR)
+            agent.run(migration_id, emitter)
+
+        elif agent_name == "dax_conversion":
+            agent = DaxConversionAgent(config.DATABASE_PATH, config.EXPORT_DIR)
+            agent.run(migration_id, emitter)
+
+        elif agent_name == "export":
+            agent = ExportAgent(config.DATABASE_PATH, config.EXPORT_DIR)
+            agent.run(migration_id, emitter)
+
+        _running_agents[agent_key] = "completed"
+
+    except Exception as e:
+        logger.error(f"Agent {agent_name} failed for {migration_id}: {e}", exc_info=True)
+        _running_agents[agent_key] = "failed"
+
+
+@router.post("/{migration_id}/agents/{agent_slug}/start")
+async def start_agent(
+    migration_id: str,
+    agent_slug: str,
+    background_tasks: BackgroundTasks,
+):
+    """Trigger a specific agent in the background. Returns immediately."""
+    if agent_slug not in _VALID_AGENTS:
+        raise HTTPException(status_code=400, detail=f"Invalid agent: {agent_slug}. Valid: {', '.join(_VALID_AGENTS)}")
+
+    row = get_migration(config.DATABASE_PATH, migration_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Migration not found")
+
+    agent_name = _AGENT_NAME_MAP[agent_slug]
+    agent_key = f"{migration_id}:{agent_name}"
+
+    # Prevent double-starts
+    if _running_agents.get(agent_key) == "running":
+        return JSONResponse(
+            status_code=409,
+            content={"detail": f"Agent '{agent_slug}' is already running for this migration."}
+        )
+
+    background_tasks.add_task(_run_agent_background, migration_id, agent_slug)
+    logger.info(f"Agent '{agent_slug}' triggered for migration {migration_id}")
+
+    return {
+        "migration_id": migration_id,
+        "agent": agent_slug,
+        "status": "started",
+        "message": f"Agent '{agent_slug}' started in background.",
+    }
+
+
+@router.get("/{migration_id}/agents/{agent_slug}/stream")
+async def stream_agent(migration_id: str, agent_slug: str):
+    """SSE stream endpoint for a specific agent's events."""
+    if agent_slug not in _VALID_AGENTS:
+        raise HTTPException(status_code=400, detail=f"Invalid agent: {agent_slug}.")
+
+    row = get_migration(config.DATABASE_PATH, migration_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Migration not found")
+
+    agent_name = _AGENT_NAME_MAP[agent_slug]
+
+    async def event_generator():
+        from workers.agent_stream_manager import agent_stream_manager
+
+        # Yield initial connection ack
+        initial = {
+            "type": "agent_event",
+            "agent": agent_name,
+            "event": "stream_connected",
+            "data": {},
+            "sub_phase": "connecting",
+            "progress": 0,
+            "message": f"Connected to {agent_slug} stream",
+        }
+        yield f"data: {json.dumps(initial)}\n\n"
+
+        queue = agent_stream_manager.register_queue(migration_id, agent_name)
+        try:
+            while True:
+                try:
+                    message = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    yield f"data: {json.dumps(message)}\n\n"
+
+                    # End stream on terminal events
+                    msg_type = message.get("type", "")
+                    if msg_type in ("agent_complete", "agent_failed"):
+                        break
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"
+        finally:
+            agent_stream_manager.unregister_queue(migration_id, agent_name, queue)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
