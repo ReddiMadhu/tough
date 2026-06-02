@@ -10,4 +10,5 @@ pydantic-settings>=2.0.0
 aiofiles>=23.0.0
 langchain-openai>=0.1.0
 langgraph>=0.2.0
+gunicorn>=21.2.0
 

@@ -23,6 +23,8 @@ class APIConfig(BaseSettings):
     DATABASE_PATH: str = "../migrations.db"
 
     # CORS Settings
+    # Set CORS_ORIGINS env var as comma-separated list for production, e.g.:
+    #   CORS_ORIGINS=https://my-frontend.azurewebsites.net,https://my-cdn.azureedge.net
     CORS_ORIGINS: List[str] = [
         "http://localhost:5173",
         "http://localhost:5174",

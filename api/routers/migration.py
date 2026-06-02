@@ -639,7 +639,15 @@ async def progress_stream(migration_id: str):
             stream_manager.unregister_queue(migration_id, queue)
 
     from workers.stream_manager import stream_manager
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -777,4 +785,12 @@ async def stream_agent(migration_id: str, agent_slug: str):
         finally:
             agent_stream_manager.unregister_queue(migration_id, agent_name, queue)
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
