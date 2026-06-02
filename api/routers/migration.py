@@ -824,6 +824,10 @@ async def start_agent(
             "message": f"Agent '{agent_slug}' has already completed.",
         }
 
+    # Clear previous run's stream history before starting a fresh run
+    from workers.agent_stream_manager import agent_stream_manager
+    agent_stream_manager.clear_history(migration_id, agent_name)
+
     background_tasks.add_task(_run_agent_background, migration_id, agent_slug)
     logger.info(f"Agent '{agent_slug}' triggered for migration {migration_id}")
 
