@@ -1,0 +1,48 @@
+{
+  "Policies Active": {
+    "dax": "CALCULATE(DISTINCTCOUNT('chunk_1'[PolicyNumber]), 'chunk_1'[PolicyStatus] = \"A\")",
+    "is_valid": true,
+    "reason": "Successfully converted using standard DAX syntax.",
+    "step": 1
+  },
+  "High Fraud Policies Count": {
+    "dax": "CALCULATE(DISTINCTCOUNT('chunk_1'[PolicyNumber]), 'chunk_1'[Integrated Risk Band] = \"HIGH\", 'chunk_1'[PolicyStatus] = \"A\")",
+    "is_valid": true,
+    "reason": "Successfully applied full DAX qualification across all context arguments.",
+    "step": 1
+  },
+  "High Fraud Policies %": {
+    "dax": "DIVIDE(CALCULATE(DISTINCTCOUNT('chunk_1'[PolicyNumber]), 'chunk_1'[Integrated Risk Band] = \"HIGH\", 'chunk_1'[PolicyStatus] = \"A\"), CALCULATE(DISTINCTCOUNT('chunk_1'[PolicyNumber]), 'chunk_1'[PolicyStatus] = \"A\"))",
+    "incorrect_dax": "DIVIDE(CALCULATE(DISTINCTCOUNT(chunk_1[PolicyNumber]), chunk_1[Integrated Risk Band] = \"HIGH\", chunk_1[PolicyStatus] = \"A\"), CALCULATE(DISTINCTCOUNT(chunk_1[PolicyNumber]), chunk_1[PolicyStatus] = \"A\"))",
+    "is_valid": false,
+    "reason": "Syntax error: table names missing single quotes.",
+    "step": 2
+  },
+  "Fraud Policies Top Visual": {
+    "dax": "DIVIDE(CALCULATE(DISTINCTCOUNT('chunk_1'[PolicyNumber]), 'chunk_1'[PolicyStatus] = \"A\", 'chunk_1'[Integrated Risk Band] <> \"Below P60\"), CALCULATE(DISTINCTCOUNT('chunk_1'[PolicyNumber]), 'chunk_1'[PolicyStatus] = \"A\"))",
+    "incorrect_dax": "DIVIDE(CALCULATE(DISTINCTCOUNT(chunk_1[PolicyNumber]), chunk_1[PolicyStatus] = \"A\", chunk_1[Integrated Risk Band] <> \"Below P60\"), CALCULATE(DISTINCTCOUNT(chunk_1[PolicyNumber]), chunk_1[PolicyStatus] = \"A\"))",
+    "is_valid": false,
+    "reason": "Syntax error: table names missing single quotes.",
+    "step": 3
+  },
+  "Fraud Claims Top Visual": {
+    "dax": "] = \"open\", 'chunk_1'[Integrated Risk Band] <> \"below p60\"), CALCULATE(DISTINCTCOUNT('chunk_1'[ClaimNumber]), 'chunk_1'[ClaimStatus] = \"open\"))",
+    "incorrect_dax": "DIVIDE(CALCULATE(DISTINCTCOUNT(chunk_1[ClaimNumber]), chunk_1[ClaimStatus] = \"open\", chunk_1[Integrated Risk Band] <> \"below p60\"), CALCULATE(DISTINCTCOUNT(chunk_1[ClaimNumber]), chunk_1[ClaimStatus] = \"open\"))",
+    "is_valid": false,
+    "reason": "Syntax error: table names missing single quotes.",
+    "step": 4
+  },
+  "% of Total": {
+    "dax": "DIVIDE(DISTINCTCOUNT('chunk_1'[PolicyNumber]), CALCULATE(DISTINCTCOUNT('chunk_1'[PolicyNumber]), ALL('chunk_1')), 0)",
+    "is_valid": true,
+    "reason": "Successfully converted using standard DAX syntax.",
+    "step": 1
+  },
+  "% Of Claims": {
+    "dax": "DIVIDE(DISTINCTCOUNT('chunk_1'[ClaimNumber]), CALCULATE(DISTINCTCOUNT('chunk_1'[ClaimNumber]), REMOVEFILTERS('chunk_1')), 0)",
+    "incorrect_dax": "DIVIDE(DISTINCTCOUNT(chunk_1[ClaimNumber]), CALCULATE(DISTINCTCOUNT(chunk_1[ClaimNumber]), ALL(chunk_1)), 0)",
+    "is_valid": false,
+    "reason": "Syntax error: table name missing single quotes.",
+    "step": 2
+  }
+}

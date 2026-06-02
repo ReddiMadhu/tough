@@ -402,9 +402,17 @@ class TMLParser:
         # Merge formulas into columns (formulas ARE columns)
         all_columns = list(self.columns)
         existing = {c["internal_name"] for c in all_columns}
+        
+        # Track formula IDs already referenced by model columns to prevent duplicates
+        referenced_formula_ids = {
+            col.get("formula_id") for col in self.columns if col.get("formula_id")
+        }
+        
         for f in self.formulas:
-            if f["internal_name"] not in existing:
+            f_id = f["internal_name"]
+            if f_id not in existing and f_id not in referenced_formula_ids:
                 all_columns.append(f)
+                existing.add(f_id)
 
         # Deduplicate joins by left+right table pair
         seen_joins = set()

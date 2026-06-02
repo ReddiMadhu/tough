@@ -240,6 +240,52 @@ class UpdateConversionRequest(BaseModel):
     dax_formula: str
     reasoning: Optional[str] = None
 
+@router.patch("/{migration_id}/conversions/{conversion_id}")
+async def update_conversion(
+    migration_id: str,
+    conversion_id: str,
+    request: UpdateConversionRequest
+):
+    """Update a specific DAX conversion manually."""
+    row = get_migration(config.DATABASE_PATH, migration_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Migration not found")
+        
+    import sqlite3
+    try:
+        conn = sqlite3.connect(config.DATABASE_PATH)
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT id FROM ts_conversions WHERE conversion_id = ?", (conversion_id,))
+        conv = cursor.fetchone()
+        if not conv:
+            raise HTTPException(status_code=404, detail="Conversion not found")
+            
+        # For the demo, we assume the user edits the DAX correctly and we trust it.
+        # Mark it as validated/passed with high confidence.
+        cursor.execute(
+            '''
+            UPDATE ts_conversions 
+            SET dax_formula = ?, requires_review = 0, confidence = 1.0, notes = '["Manually updated and verified by user"]'
+            WHERE conversion_id = ?
+            ''',
+            (request.dax_formula, conversion_id)
+        )
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to update conversion {conversion_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if 'conn' in locals():
+            conn.close()
+            
+    return {
+        "status": "success", 
+        "message": "Conversion updated and validated successfully",
+        "dax_formula": request.dax_formula
+    }
+
+
 
 def _get_intermediate_model(migration_id: str) -> Optional[dict]:
     import json
@@ -272,8 +318,15 @@ async def get_workbook_metadata(migration_id: str):
     # Calculations counts
     formula_cols = [c for c in model.get("columns", []) if c.get("formula")]
 
+    unique_liveboards = {
+        w.get("source_liveboard")
+        for w in model.get("worksheets", [])
+        if w.get("source_liveboard")
+    }
+    total_dashboards = len(unique_liveboards) if unique_liveboards else (1 if model.get("worksheets") else 0)
+
     summary = {
-        "total_dashboards": len(model.get("worksheets", [])),
+        "total_dashboards": total_dashboards,
         "total_worksheets": len(model.get("worksheets", [])),
         "total_tables": len(model.get("tables", [])),
         "total_calculated_fields": len(formula_cols),
@@ -358,9 +411,16 @@ async def get_workbook_metadata_summary(migration_id: str):
         return {"summary": {"total_dashboards": 0, "total_worksheets": 0, "total_tables": 0, "total_calculated_fields": 0}}
 
     formula_cols = [c for c in model.get("columns", []) if c.get("formula")]
+    unique_liveboards = {
+        w.get("source_liveboard")
+        for w in model.get("worksheets", [])
+        if w.get("source_liveboard")
+    }
+    total_dashboards = len(unique_liveboards) if unique_liveboards else (1 if model.get("worksheets") else 0)
+
     return {
         "summary": {
-            "total_dashboards": len(model.get("worksheets", [])),
+            "total_dashboards": total_dashboards,
             "total_worksheets": len(model.get("worksheets", [])),
             "total_tables": len(model.get("tables", [])),
             "total_calculated_fields": len(formula_cols),

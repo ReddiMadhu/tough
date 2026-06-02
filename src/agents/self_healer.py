@@ -51,41 +51,127 @@ class SelfHealingAgent:
             )
         failure_summary = "\n".join(failure_details)
 
-        prompt = f"""You are an expert DAX debugger specializing in migrating ThoughtSpot analytics models to Power BI.
-We are on self-healing correction attempt {attempt_number} of {self.max_attempts} for metric `{measure_name}`.
+        prompt = f"""You are a world-class DAX debugger specializing in migrating ThoughtSpot analytics to Power BI.
+This is self-healing correction attempt {attempt_number} of {self.max_attempts} for metric `{measure_name}`.
 
-## METRIC DETAILS:
-- Name: {measure_name}
-- Original ThoughtSpot Formula: `{original_formula}`
-- Current Generated DAX (Failed): `{failed_dax}`
+---
 
-## SCHEMA CONTEXT (Use this to resolve correct column and table names):
-{schema_context or "No schema context provided. Default to '[Column Name]' formatting with standard table 'Table'."}
+## METRIC CONTEXT
+- **Measure Name**: `{measure_name}`
+- **Original ThoughtSpot Formula**: `{original_formula}`
+- **Current Generated DAX (Failed)**: `{failed_dax}`
 
-## VALIDATION DISCREPANCIES:
+## SCHEMA CONTEXT (MANDATORY — use EXACT table and column names)
+{schema_context or "No schema context provided. Default to '[Column Name]' formatting."}
+
+## COMPILATION & VALIDATION ERRORS
 {failure_summary}
 
-## AUDIT ANALYSIS:
-- Error Categories: {json.dumps(error_categories)}
+## ERROR CATEGORY DISTRIBUTION
+{json.dumps(error_categories)}
 
-## YOUR TASK:
-Generate a corrected DAX formula that fixes the discrepancy.
+---
 
-**Rules for DAX correction:**
-1. Check division context: Always use `DIVIDE(num, den, 0)` instead of `num / den`.
-2. Check aggregation: In ThoughtSpot, columns are often aggregated implicitly or explicitly. Ensure DAX aggregates correctly (e.g. `SUM('Table'[Col])`).
-3. Check filter context: If `group_aggregate` was used with a dimension list, ALLEXCEPT or REMOVEFILTERS might be required to lock the aggregation grain.
-4. If there is a scaling issue (e.g. off by 100x), check whether the ThoughtSpot formula expects decimal ratios while DAX does not, or vice versa.
-5. STRICT SCHEMA ADHERENCE: NEVER hallucinate or invent table or column names. You MUST use the exact table and column names provided in the SCHEMA CONTEXT. If the schema specifies that a column is in the 'Sales' table, write `'Sales'[Column]`, NOT `'Revenue'[Column]` or generic names.
-6. MEASURE CONTEXT: Because this corrected DAX formula is a **measure** (not a calculated column), it MUST NOT reference naked table column names directly (e.g., `'Sales'[Revenue]` without aggregation). You MUST wrap all columns in an aggregation function (like `SUM('Table'[Column])`, `AVERAGE('Table'[Column])`, `MAX('Table'[Column])`, etc.) when referencing them in the formula. Do not let the healer remove SUM() to satisfy row-level evaluations. If a row-level condition is needed, wrap it in aggregation functions that compile inside a measure.
+## DAX MEASURE RULES (Your corrected formula MUST obey ALL of these)
 
+### R1 — No Naked Column References
+A DAX **measure** MUST aggregate all column references. `'Table'[Col]` alone causes a compilation error.
+ALWAYS wrap in: SUM(), AVERAGE(), COUNT(), DISTINCTCOUNT(), MIN(), MAX(), etc.
+**Exception**: Inside iterators (SUMX, FILTER, AVERAGEX, ADDCOLUMNS) naked refs are valid (row context).
 
-Respond ONLY with a valid JSON object in the exact format below (no markdown wraps, no explanation outside JSON):
+### R2 — DIVIDE Safety
+ALL division MUST use `DIVIDE(numerator, denominator, 0)`. NEVER use `a / b`.
+
+### R3 — CALCULATE Filter Arguments
+CALCULATE() filter arguments must be:
+- Boolean expressions: `'Table'[Col] = "value"`
+- Table functions: ALL(), ALLEXCEPT(), FILTER(), REMOVEFILTERS()
+NEVER pass a naked column ref as a CALCULATE filter argument.
+
+### R4 — ALLEXCEPT Semantics
+`ALLEXCEPT('Table', 'Table'[Dim])` removes ALL filters from the table EXCEPT the named column.
+For ThoughtSpot `group_aggregate(expr, {{dim}})`, use: `CALCULATE(expr, ALLEXCEPT('Table', 'Table'[dim]))`.
+For grand totals (no dims), use `CALCULATE(expr, ALL('Table'))`.
+
+### R5 — Table Qualification
+ALL column refs MUST use `'TableName'[ColumnName]`. Measure refs use bare `[MeasureName]`.
+NEVER hallucinate table names — use ONLY tables from the SCHEMA CONTEXT above.
+
+### R6 — No Ghost Date Tables
+Do NOT assume a `'Date'[Date]` table exists unless it's in the schema.
+Use actual date columns from the schema for time intelligence functions.
+
+### R7 — Cumulative / Running Totals
+Pattern: `CALCULATE(AGG('Table'[Col]), FILTER(ALL('DateTable'[DateCol]), 'DateTable'[DateCol] <= MAX('DateTable'[DateCol])))`
+
+### R8 — Moving Averages
+Pattern: `AVERAGEX(DATESINPERIOD('Table'[Date], MAX('Table'[Date]), -N, DAY), CALCULATE(SUM('Table'[Value])))`
+
+### R9 — group_aggregate → CALCULATE + ALLEXCEPT
+ThoughtSpot `group_aggregate(sum(col), {{dim1, dim2}})` →
+`CALCULATE(SUM('Table'[col]), ALLEXCEPT('Table', 'Table'[dim1], 'Table'[dim2]))`.
+`query_groups()` has NO DAX equivalent.
+
+### R10 — Conditional: if/then/else → IF()
+`if(cond) then val else val` → `IF(condition, then_value, else_value)`
+Boolean: `and` → `&&`, `or` → `||`, `!=` → `<>`
+
+### R11 — Null Handling
+`ifnull(x, y)` → `IF(ISBLANK(x), y, x)`
+`isnull(x)` → `ISBLANK(x)`
+
+### R12 — VAR/RETURN for Complex Logic
+Use VAR to break down complex calculations. This improves readability and performance.
+
+### R13 — Cross-Table References
+Use RELATED() for many-to-one lookups inside iterators.
+Let relationships propagate filters — do NOT manually filter related tables.
+
+---
+
+## FEW-SHOT CORRECTION EXAMPLES
+
+### Fix Example 1 — Naked Column → Aggregated
+- **Failed**: `Revenue = 'Sales'[Amount]`
+- **Error**: Naked column reference outside aggregation
+- **Fixed**: `Revenue = SUM('Sales'[Amount])`
+- **Reasoning**: Measures require aggregation; wrapped in SUM().
+
+### Fix Example 2 — Raw Division → DIVIDE
+- **Failed**: `Margin = SUM('Sales'[Profit]) / SUM('Sales'[Revenue])`
+- **Error**: Division by zero risk
+- **Fixed**: `Margin = DIVIDE(SUM('Sales'[Profit]), SUM('Sales'[Revenue]), 0)`
+- **Reasoning**: Replaced `/` with DIVIDE() for safe division.
+
+### Fix Example 3 — Missing ALLEXCEPT Context
+- **Failed**: `Regional Total = SUM('Sales'[Amount])`
+- **Error**: Missing filter context for group_aggregate
+- **Fixed**: `Regional Total = CALCULATE(SUM('Sales'[Amount]), ALLEXCEPT('Sales', 'Sales'[Region]))`
+- **Reasoning**: Added CALCULATE + ALLEXCEPT to pin aggregation to Region level.
+
+### Fix Example 4 — Wrong Table Name
+- **Failed**: `Total = SUM('Revenue'[Amount])`
+- **Error**: Table 'Revenue' does not exist
+- **Fixed**: `Total = SUM('Sales'[Amount])`
+- **Reasoning**: Corrected table name from schema context.
+
+---
+
+## YOUR TASK
+
+**Think step-by-step** before generating your fix:
+1. Read the compilation/validation errors carefully.
+2. Identify which DAX rules (R1-R13) are violated.
+3. Plan your correction — what exactly needs to change?
+4. Generate the corrected DAX using ONLY schema-provided names.
+5. Verify your fix against all 13 rules mentally.
+
+Respond ONLY with a valid JSON object (no markdown wraps):
 {{
-  "root_cause": "Detailed explanation of why the current DAX failed validation...",
-  "corrected_dax": "Measure = <corrected DAX formula>",
-  "explanation": "What changes were made and why...",
-  "changes_made": ["Changed operator X to Y", "Added DIVIDE safety", "Adjusted filter context"]
+  "root_cause": "Detailed step-by-step explanation of WHY the current DAX failed...",
+  "corrected_dax": "{measure_name} = <corrected DAX formula>",
+  "explanation": "What changes were made and why, referencing specific rules...",
+  "changes_made": ["Changed X to Y (Rule R2)", "Added ALLEXCEPT for filter context (Rule R4)"]
 }}
 """
         try:

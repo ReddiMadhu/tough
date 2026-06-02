@@ -43,6 +43,7 @@ class APIConfig(BaseSettings):
     ENABLE_LLM_VALIDATION: bool = True
     LLM_TEMPERATURE: float = 0.1
     LLM_MAX_TOKENS: int = 4000
+    LLM_SLEEP_TIME: float = 0.0
 
 
     class Config:

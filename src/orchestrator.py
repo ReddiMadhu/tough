@@ -151,7 +151,7 @@ class MigrationOrchestrator:
                 schema_context_lines.append(f"Primary table: '{default_table}'")
             if col_table_map:
                 schema_context_lines.append("Known column mappings:")
-                for col, tbl in list(col_table_map.items())[:30]:
+                for col, tbl in col_table_map.items():
                     schema_context_lines.append(f"  - Column '{col}' is in table '{tbl}'")
             known_measures = [c["measure_name"] for c in dax_conversions]
             if known_measures:
@@ -367,7 +367,9 @@ class MigrationOrchestrator:
         for table in model.get("tables", []):
             table_name = table.get("name", "")
             for col in table.get("column_details", []):
-                col_map[col.get("name", "")] = table_name
+                col_name = col.get("name", "")
+                if col_name not in col_map:
+                    col_map[col_name] = table_name
             for col_name in table.get("columns", []):
                 if col_name not in col_map:
                     col_map[col_name] = table_name

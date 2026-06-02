@@ -5,6 +5,7 @@ Uses Gemini (or Azure OpenAI / OpenAI compatible endpoint) via LangChain.
 
 import os
 import json
+import time
 from typing import Dict, Any, Optional, List
 from loguru import logger
 from pydantic import BaseModel, Field
@@ -114,13 +115,23 @@ class LLMReasoner:
         except Exception as e:
             logger.error(f"Failed to initialize LLM: {e}")
 
+    def invoke(self, prompt: str) -> Any:
+        """
+        Execute a prompt against the LLM with rate-limiting sleep if configured.
+        """
+        if not self.llm:
+            raise ValueError("LLM is not initialized")
+        sleep_time = getattr(config, "LLM_SLEEP_TIME", 0.0)
+        if sleep_time > 0:
+            logger.info(f"Rate limit safety: sleeping for {sleep_time}s before LLM call")
+            time.sleep(sleep_time)
+        return self.llm.invoke(prompt)
+
     def reason(self, prompt: str) -> str:
         """
         Execute a raw prompt against the LLM and return the string content response.
         """
-        if not self.llm:
-            raise ValueError("LLM is not initialized")
-        response = self.llm.invoke(prompt)
+        response = self.invoke(prompt)
         return response.content
 
     def translate_formula(
@@ -132,40 +143,107 @@ class LLMReasoner:
         if not self.llm:
             return None
 
-        prompt = f"""You are a senior Business Intelligence architect and an expert in converting analytics systems from ThoughtSpot to Power BI.
-Translate the following ThoughtSpot formula into a clean, functionally identical Power BI DAX formula.
+        prompt = f"""You are a world-class Business Intelligence engineer specializing in ThoughtSpot-to-Power BI DAX conversion.
 
-CONTEXT & RULES:
-1. In ThoughtSpot, columns are often referenced directly by name (e.g. `sum(sales)`).
-2. In Power BI DAX, measures MUST have a table qualifier for columns (e.g. `SUM('Table'[sales])`) but MUST NOT have a table qualifier for other measures.
-3. If division is involved, use the safe DAX `DIVIDE(numerator, denominator, 0)` pattern to prevent divide-by-zero errors.
-4. If checking for null values, use `ISBLANK(...)` instead of `isnull` or `ifnull`.
-5. Support aggregations (`SUM`, `AVERAGE`, `COUNT`, `DISTINCTCOUNT`, `MIN`, `MAX`).
-6. Support conditional statements (`IF`, `SWITCH`).
-7. For cumulative totals, use `CALCULATE(..., FILTER(ALL(...), ...))`.
-8. STRICT SCHEMA ADHERENCE: NEVER hallucinate or invent table names. You MUST use the exact table names provided in the SCHEMA CONTEXT. If the schema specifies that 'revenue' is in the 'Sales' table, write `'Sales'[Revenue]`, NOT `'Revenue'[Revenue]`.
-9. NO GHOST DATE TABLES: For time intelligence functions (like `SAMEPERIODLASTYEAR`), do NOT assume a generic `'Date'[Date]` table exists unless it is provided in the schema context. Use an existing date column from the schema if possible, or add a note if missing.
+---
 
-SCHEMA CONTEXT (Use this to resolve correct column and table names if applicable):
-{schema_context or "No schema context provided. Default to '[Column Name]' formatting with standard table 'Table'."}
+## TASK
+Translate the ThoughtSpot formula below into a clean, functionally identical Power BI DAX measure.
 
-FORMULA TO CONVERT:
-- Measure Name: {measure_name}
-- Original ThoughtSpot Formula: {formula}
+## INPUT
+- **Measure Name**: `{measure_name}`
+- **ThoughtSpot Formula**: `{formula}`
 
-INSTRUCTIONS:
-Respond ONLY with a valid JSON object in the exact format shown below. No explanation text, no markdown block wrappers.
-JSON Format:
+## SCHEMA CONTEXT (MANDATORY — use EXACT names from here)
+{schema_context or "No schema context provided. Default to '[Column Name]' with table 'Table'."}
+
+---
+
+## DAX MEASURE RULES (Your translation MUST obey ALL of these)
+
+### R1 — Aggregation Required
+In DAX measures, ALL column references MUST be inside an aggregation: SUM(), AVERAGE(), COUNT(), DISTINCTCOUNT(), MIN(), MAX().
+**Exception**: Inside iterators (SUMX, FILTER, AVERAGEX, ADDCOLUMNS) naked column refs are valid.
+
+### R2 — DIVIDE Safety
+ALL division MUST use `DIVIDE(numerator, denominator, 0)`. NEVER use raw `a / b`.
+
+### R3 — Table Qualification
+Columns: `'TableName'[ColumnName]` (with single-quoted table).
+Measures: `[MeasureName]` (no table prefix).
+NEVER invent or hallucinate table names.
+
+### R4 — group_aggregate Translation
+- `group_aggregate(sum(col), {{dim1, dim2}})` → `CALCULATE(SUM('T'[col]), ALLEXCEPT('T', 'T'[dim1], 'T'[dim2]))`
+- `group_aggregate(sum(col), {{}})` (grand total) → `CALCULATE(SUM('T'[col]), ALL('T'))`
+- `query_groups()` → NO DAX equivalent; output BLANK() with TODO comment.
+
+### R5 — CALCULATE Filter Context
+CALCULATE() filter arguments must be Boolean expressions or table functions (ALL, ALLEXCEPT, FILTER).
+
+### R6 — Cumulative / Running Totals
+`CALCULATE(SUM('T'[Col]), FILTER(ALL('T'[DateCol]), 'T'[DateCol] <= MAX('T'[DateCol])))`
+
+### R7 — Moving Averages
+`AVERAGEX(DATESINPERIOD('T'[Date], MAX('T'[Date]), -N, DAY), CALCULATE(SUM('T'[Value])))`
+
+### R8 — Conditional Logic
+`if(cond) then val else val` → `IF(condition, then_value, else_value)`
+`and` → `&&`, `or` → `||`, `!=` → `<>`, `isnull()` → `ISBLANK()`, `ifnull(x,y)` → `IF(ISBLANK(x), y, x)`
+
+### R9 — No Ghost Tables
+Do NOT assume 'Date'[Date] exists unless in schema. Use actual date columns.
+
+### R10 — VAR/RETURN
+For complex formulas, use VAR to break down logic into named steps.
+
+---
+
+## TRANSLATION EXAMPLES
+
+### Example 1 — Simple Aggregation
+- **ThoughtSpot**: `sum(revenue)`
+- **DAX**: `Total Revenue = SUM('Sales'[Revenue])`
+- **Pattern**: DIRECT_AGG
+
+### Example 2 — Group Aggregate (LOD)
+- **ThoughtSpot**: `group_aggregate(sum(sales), {{region}})`
+- **DAX**: `Regional Sales = CALCULATE(SUM('Sales'[Amount]), ALLEXCEPT('Sales', 'Sales'[Region]))`
+- **Pattern**: CALCULATE_ALLEXCEPT
+
+### Example 3 — Conditional with Division
+- **ThoughtSpot**: `if (sum(revenue) > 0) then sum(profit) / sum(revenue) else 0`
+- **DAX**: `Profit Margin = IF(SUM('Sales'[Revenue]) > 0, DIVIDE(SUM('Sales'[Profit]), SUM('Sales'[Revenue]), 0), 0)`
+- **Pattern**: CONDITIONAL
+
+### Example 4 — Percent of Total
+- **ThoughtSpot**: `sum(sales) / group_sum(sales)`
+- **DAX**: `Pct of Total = DIVIDE(SUM('Sales'[Amount]), CALCULATE(SUM('Sales'[Amount]), ALL('Sales')), 0)`
+- **Pattern**: PERCENT_OF_TOTAL
+
+---
+
+## REASONING (Think step-by-step internally)
+1. Parse the ThoughtSpot formula: what functions, columns, and logic does it use?
+2. Map each ThoughtSpot function to its DAX equivalent using the rules above.
+3. Resolve all column names against the SCHEMA CONTEXT.
+4. Construct the DAX formula with proper table qualification and aggregation.
+5. Verify against all 10 rules — especially R1 (no naked columns) and R2 (DIVIDE safety).
+
+---
+
+## OUTPUT FORMAT
+Respond ONLY with a valid JSON object (no markdown wraps):
 {{
-  "dax_formula": "translated DAX string (e.g., \\"Measure_Name = SUM('Table'[Column])\\")",
-  "confidence": 0.0 to 1.0 (float reflecting translation certainty),
+  "dax_formula": "{measure_name} = <translated DAX>",
+  "confidence": 0.0 to 1.0,
   "pattern": "AI_TRANSLATION",
-  "notes": ["Brief note about translation choices", "Any filter context warnings"],
+  "notes": ["Brief note about translation choices", "Any warnings"],
   "requires_review": true or false
 }}"""
 
         try:
-            response = self.llm.invoke(prompt)
+            response = self.invoke(prompt)
             parsed_res = clean_and_validate_json(response.content, FormulaTranslationResponse)
             result = parsed_res.model_dump()
             
@@ -227,7 +305,7 @@ JSON Format:
 }}"""
 
         try:
-            response = self.llm.invoke(prompt)
+            response = self.invoke(prompt)
             parsed_res = clean_and_validate_json(response.content, ModelNarrativeResponse)
             return parsed_res.narrative
         except Exception as e:

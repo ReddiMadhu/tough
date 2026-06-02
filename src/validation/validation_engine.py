@@ -74,6 +74,212 @@ class ValidationEngine:
 
         return True, None
 
+    # ── Schema & Naked Column Validators (Compiler-like) ─────────────────────
+
+    # DAX aggregation functions that legally wrap column references
+    _AGG_FUNCTIONS = {
+        "SUM", "AVERAGE", "COUNT", "COUNTA", "COUNTBLANK", "COUNTROWS",
+        "DISTINCTCOUNT", "DISTINCTCOUNTNOBLANK", "MIN", "MAX",
+        "STDEV.S", "STDEV.P", "VAR.S", "VAR.P",
+        "MEDIAN", "PERCENTILEX.INC", "PERCENTILEX.EXC",
+        "PRODUCT", "PRODUCTX",
+    }
+
+    # DAX iterator functions where naked column references are valid (row context)
+    _ITERATOR_FUNCTIONS = {
+        "SUMX", "AVERAGEX", "COUNTX", "MINX", "MAXX", "RANKX",
+        "FILTER", "ADDCOLUMNS", "SELECTCOLUMNS", "GENERATE", "GENERATEALL",
+        "TOPN", "SAMPLE", "EARLIER", "EARLIEST",
+        "CALCULATETABLE", "DATATABLE", "ROW",
+    }
+
+    def check_schema_references(
+        self,
+        dax_formula: str,
+        col_table_map: Dict[str, str],
+        column_metadata: Dict[str, Dict],
+        known_measures: set,
+        table_columns: Optional[Dict[str, List[str]]] = None,
+    ) -> Tuple[bool, List[str]]:
+        """
+        Verify all table and column references in the DAX formula exist in the schema.
+
+        Extracts:
+          - Qualified refs:   'TableName'[ColumnName]
+          - Unqualified refs: [ColumnName]  (not preceded by ')
+
+        Returns (passed, errors) with compiler-like error messages.
+        """
+        errors = []
+
+        # Build lookup sets
+        known_tables = set()
+        table_columns_lookup: Dict[str, set] = {}  # table_name -> {col1, col2, ...}
+        all_columns = set()
+
+        if table_columns:
+            for tbl_name, cols in table_columns.items():
+                known_tables.add(tbl_name)
+                table_columns_lookup[tbl_name] = set(cols)
+                for c in cols:
+                    all_columns.add(c)
+        else:
+            for col_name, tbl_name in col_table_map.items():
+                known_tables.add(tbl_name)
+                table_columns_lookup.setdefault(tbl_name, set()).add(col_name)
+                all_columns.add(col_name)
+
+        # Also add from column_metadata
+        for col_name in column_metadata:
+            all_columns.add(col_name)
+
+        # Normalize known measures for comparison
+        norm_measures = {m.lower().strip() for m in known_measures}
+
+        # ── Extract qualified references: 'Table'[Column] ──
+        qualified_refs = re.findall(r"'([^']+)'\[([^\]]+)\]", dax_formula)
+        for table, column in qualified_refs:
+            if table not in known_tables:
+                # Fuzzy check — maybe different casing
+                table_lower = table.lower()
+                found = any(t.lower() == table_lower for t in known_tables)
+                if not found:
+                    errors.append(f"Error: Table '{table}' does not exist in schema. Known tables: {', '.join(sorted(known_tables)[:5])}")
+            else:
+                cols_in_table = table_columns_lookup.get(table, set())
+                if column not in cols_in_table:
+                    # Fuzzy check column name
+                    col_lower = column.lower()
+                    found = any(c.lower() == col_lower for c in cols_in_table)
+                    if not found and column.lower() not in norm_measures:
+                        errors.append(f"Error: Column '{column}' not found in table '{table}'. Available: {', '.join(sorted(cols_in_table)[:5])}")
+
+        # ── Extract unqualified references: [Column] (not preceded by ') ──
+        # Match [Something] that is NOT immediately preceded by a single-quote
+        unqualified_refs = re.findall(r"(?<!')\[([^\]]+)\]", dax_formula)
+        for ref in unqualified_refs:
+            ref_clean = ref.strip()
+            # Skip if it's a qualified part we already checked
+            if any(ref_clean == col for _, col in qualified_refs):
+                continue
+            # Check if it's a known measure
+            if ref_clean.lower() in norm_measures:
+                continue
+            # Check if it's a known column
+            if ref_clean in all_columns:
+                continue
+            # Fuzzy check
+            ref_lower = ref_clean.lower()
+            found = any(c.lower() == ref_lower for c in all_columns) or ref_lower in norm_measures
+            if not found:
+                errors.append(f"Warning: Unresolved reference '[{ref_clean}]' — not a known column or measure")
+
+        passed = len([e for e in errors if e.startswith("Error:")]) == 0
+        return passed, errors
+
+    def check_naked_columns(
+        self,
+        dax_formula: str,
+        col_table_map: Dict[str, str],
+        column_metadata: Dict[str, Dict],
+        known_measures: set,
+    ) -> Tuple[bool, List[str]]:
+        """
+        Detect naked column references — columns used without aggregation in a measure context.
+
+        A 'naked' reference is a 'Table'[Column] that appears outside of:
+          - An aggregation function (SUM, AVERAGE, COUNT, etc.)
+          - An iterator function (SUMX, FILTER, ADDCOLUMNS, etc.)
+          - A known measure reference
+
+        Uses backward-scanning to find the enclosing function name for each reference.
+        """
+        warnings = []
+
+        norm_measures = {m.lower().strip() for m in known_measures}
+
+        # Find all qualified column references with their positions
+        for match in re.finditer(r"'([^']+)'\[([^\]]+)\]", dax_formula):
+            table = match.group(1)
+            column = match.group(2)
+            pos = match.start()
+
+            # Skip if this column is actually a known measure
+            if column.lower() in norm_measures:
+                continue
+
+            # Check if this reference is inside an aggregation or iterator context
+            if self._is_inside_valid_context(dax_formula, pos):
+                continue
+
+            warnings.append(
+                f"Warning: Naked column reference '{table}'[{column}] at position {pos} — "
+                f"not inside an aggregation function (SUM, AVERAGE, etc.) or iterator (SUMX, FILTER, etc.)"
+            )
+
+        # Check unqualified column references too
+        for match in re.finditer(r"(?<!')\[([^\]]+)\]", dax_formula):
+            ref = match.group(1).strip()
+            pos = match.start()
+
+            # Skip measure references
+            if ref.lower() in norm_measures:
+                continue
+
+            # Skip if not a known column (it might be a measure we don't know about)
+            ref_lower = ref.lower()
+            is_column = any(c.lower() == ref_lower for c in col_table_map)
+            if not is_column:
+                continue
+
+            if not self._is_inside_valid_context(dax_formula, pos):
+                warnings.append(
+                    f"Warning: Naked column reference [{ref}] at position {pos} — "
+                    f"not inside an aggregation or iterator function"
+                )
+
+        passed = len(warnings) == 0
+        return passed, warnings
+
+    def _is_inside_valid_context(self, dax_formula: str, ref_pos: int) -> bool:
+        """
+        Check if the column reference at `ref_pos` is inside a valid aggregation
+        or iterator function by scanning backward for the enclosing function name.
+        """
+        # Scan backward from ref_pos to find the nearest unmatched '('
+        depth = 0
+        i = ref_pos - 1
+        while i >= 0:
+            ch = dax_formula[i]
+            if ch == ')':
+                depth += 1
+            elif ch == '(':
+                if depth == 0:
+                    # Found the unmatched open paren — extract function name before it
+                    func_end = i
+                    # Skip whitespace before '('
+                    j = func_end - 1
+                    while j >= 0 and dax_formula[j] in (' ', '\t', '\n', '\r'):
+                        j -= 1
+                    # Extract function name (word characters and dots for STDEV.S etc.)
+                    func_start = j
+                    while func_start >= 0 and (dax_formula[func_start].isalnum() or dax_formula[func_start] in '.'):
+                        func_start -= 1
+                    func_name = dax_formula[func_start + 1:j + 1].upper().strip()
+
+                    if func_name in self._AGG_FUNCTIONS or func_name in self._ITERATOR_FUNCTIONS:
+                        return True
+
+                    # Not a valid context at this level, but might be nested deeper
+                    # Continue scanning backward to check outer contexts
+                    i = func_start
+                    continue
+                else:
+                    depth -= 1
+            i -= 1
+
+        return False
+
     def _validate_with_llm(self, original_formula: str, dax_formula: str, measure_name: str) -> Optional[Dict[str, Any]]:
         """Validate ThoughtSpot vs DAX semantic equivalency using LLM reasoner."""
         try:
@@ -81,48 +287,130 @@ class ValidationEngine:
             if not llm.llm:
                 return None
 
-            prompt = f"""You are a QA Validation Engine for a ThoughtSpot to Power BI migration system.
-Your job is to perform a rigorous semantic audit comparing a source ThoughtSpot formula and a generated DAX measure.
+            prompt = f"""You are an expert DAX validation engine performing a rigorous semantic audit for a ThoughtSpot-to-Power BI migration.
 
-SOURCE METRIC:
-- Name: {measure_name}
-- Original ThoughtSpot: `{original_formula}`
-- Generated DAX: `{dax_formula}`
+---
 
-Evaluate if the DAX formula is functionally and mathematically equivalent to the ThoughtSpot formula.
-Pay attention to:
-1. Aggregation levels (e.g. SUM vs AVERAGE vs CALCULATE).
-2. Filter contexts (e.g. grouping by dimension in group_aggregate vs ALLEXCEPT in DAX).
-3. Date offsets/logic.
-4. Division zero-handling (e.g. DIVIDE vs raw division).
+## TASK
+Compare the source ThoughtSpot formula against the generated DAX measure and determine if they are functionally and mathematically equivalent.
 
-OUTPUT DIRECTIONS:
-1. Provide an overall passed boolean and pass_rate (0.0 to 1.0).
-2. Categorize any error using one of the following exact strings:
-   - "PERFECT_MATCH" (if equivalent)
-   - "ROUNDING_ERROR" (minor difference)
-   - "NULL_HANDLING" (mismatch in handling blanks/nulls)
-   - "CONTEXT_SHIFT" (mismatch in filter context or CALCULATE filters)
-   - "SCALE_ERROR" (e.g. 100x percent difference)
-   - "AGGREGATION_MISMATCH" (incorrect SUM/AVG/COUNT operator)
-   - "MISSING_VALUE" (cannot calculate)
-3. Generate 3 to 5 realistic "mock_test_slices" showing a side-by-side comparison of results for specific dimension slices.
-    - Each slice should contain:
-      - "dimensions": a dictionary of keys and values (e.g., {{"Region": "North", "Year": "2024"}})
-      - "source_value": a mock expected number representing the ThoughtSpot output (e.g., 1500.0)
-      - "tableau_value": a mock expected number representing the ThoughtSpot output (e.g., 1500.0)
-      - "dax_value": the mock number returned by the DAX formula (equal to source_value if passed, otherwise differing)
-      - "delta": abs(source_value - dax_value)
-      - "relative_error": delta / abs(source_value) if source_value != 0 else 0
-      - "passed": boolean
-      - "error_category": string (e.g. "PERFECT_MATCH" or "CONTEXT_SHIFT")
+## SOURCE METRIC
+- **Measure Name**: `{measure_name}`
+- **Original ThoughtSpot Formula**: `{original_formula}`
+- **Generated DAX Formula**: `{dax_formula}`
 
-Respond ONLY with a JSON object in this format (no markdown code-block wraps):
+---
+
+## DAX COMPILATION & SEMANTIC RULES (Validate against ALL of these)
+
+### Rule 1 — Naked Column References
+A DAX **measure** MUST aggregate all column references. `'Sales'[Revenue]` alone is ILLEGAL in a measure.
+It MUST be wrapped in SUM(), AVERAGE(), COUNT(), MIN(), MAX(), DISTINCTCOUNT(), etc.
+**Exception**: Inside iterator functions (SUMX, FILTER, AVERAGEX, ADDCOLUMNS), naked column refs are valid because they operate in row context.
+
+### Rule 2 — CALCULATE Context
+CALCULATE() modifies filter context. Every filter argument inside CALCULATE must be either:
+- A Boolean expression: `Product[Color] = "Red"`
+- A table function: `ALL(Table)`, `ALLEXCEPT(Table, Table[Col])`, `FILTER(Table, ...)`
+Do NOT pass naked column references as filter arguments.
+
+### Rule 3 — DIVIDE Safety
+All division operations MUST use `DIVIDE(numerator, denominator, 0)` or `DIVIDE(numerator, denominator, BLANK())`.
+Raw division (`a / b`) risks divide-by-zero errors.
+
+### Rule 4 — ALLEXCEPT vs REMOVEFILTERS
+`ALLEXCEPT('Table', 'Table'[Col1], 'Table'[Col2])` removes all filters on the table EXCEPT the named columns.
+It does NOT "keep" only those columns — it removes everything else. Understand this distinction.
+For ThoughtSpot `group_aggregate(expr, {{dim1, dim2}})`, the correct pattern is:
+`CALCULATE(expr, ALLEXCEPT('Table', 'Table'[dim1], 'Table'[dim2]))`.
+
+### Rule 5 — group_aggregate Translation
+ThoughtSpot `group_aggregate(sum(col), {{dim}})` → DAX `CALCULATE(SUM('Table'[col]), ALLEXCEPT('Table', 'Table'[dim]))`.
+If the dimension list is empty (grand total), use `ALL('Table')` instead of `ALLEXCEPT`.
+The `query_groups()` function has NO DAX equivalent — it must be flagged.
+
+### Rule 6 — Cumulative / Running Totals
+ThoughtSpot cumulative patterns → `CALCULATE(SUM('Table'[Col]), FILTER(ALL('DateTable'[Date]), 'DateTable'[Date] <= MAX('DateTable'[Date])))`.
+The date column must come from the actual schema, NOT a generic 'Date'[Date] table.
+
+### Rule 7 — Moving Averages
+Use `AVERAGEX(DATESINPERIOD('Table'[Date], MAX('Table'[Date]), -N, DAY), CALCULATE(SUM('Table'[Value])))`.
+Verify the period length matches the original formula.
+
+### Rule 8 — Aggregation Level Correctness
+Verify the DAX uses the SAME aggregation operator as ThoughtSpot:
+- sum() → SUM()
+- average() → AVERAGE()
+- count() → COUNT() or COUNTA()
+- unique_count() → DISTINCTCOUNT()
+- min()/max() → MIN()/MAX()
+
+### Rule 9 — Conditional Logic
+ThoughtSpot `if(cond) then val else val` → DAX `IF(condition, then_value, else_value)`.
+Boolean operators: `and` → `&&`, `or` → `||`, `not` → `NOT()`.
+Comparison: `!=` → `<>`.
+
+### Rule 10 — Null/Blank Handling
+ThoughtSpot `ifnull(x, default)` → DAX `IF(ISBLANK(x), default, x)`.
+ThoughtSpot `isnull(x)` → DAX `ISBLANK(x)`.
+
+### Rule 11 — Table Qualification
+ALL column references MUST use the full `'TableName'[ColumnName]` format.
+Measure references use bare `[MeasureName]` WITHOUT table prefix.
+
+### Rule 12 — VAR Best Practice
+Complex formulas SHOULD use VAR/RETURN for clarity and performance.
+Verify that VAR definitions are correct and that RETURN references the right variable.
+
+### Rule 13 — Cross-Table Filters
+When a measure references columns from multiple tables, ensure the relationships exist.
+Use RELATED() for many-to-one lookups, RELATEDTABLE() for one-to-many.
+
+---
+
+## FEW-SHOT EXAMPLES
+
+### Example 1 — PASS (Simple aggregation)
+- ThoughtSpot: `sum(revenue)`
+- DAX: `Total Revenue = SUM('Sales'[Revenue])`
+- Verdict: PERFECT_MATCH ✓ — Direct SUM mapping with correct table qualification.
+
+### Example 2 — FAIL (Naked column reference)
+- ThoughtSpot: `sum(revenue) / sum(cost)`
+- DAX: `Margin = 'Sales'[Revenue] / 'Sales'[Cost]`
+- Verdict: AGGREGATION_MISMATCH ✗ — Naked column references outside aggregation. Must be `DIVIDE(SUM('Sales'[Revenue]), SUM('Sales'[Cost]), 0)`.
+
+### Example 3 — FAIL (Context shift)
+- ThoughtSpot: `group_aggregate(sum(sales), {{region}})`
+- DAX: `Regional Sales = SUM('Sales'[Amount])`
+- Verdict: CONTEXT_SHIFT ✗ — Missing CALCULATE + ALLEXCEPT to pin the aggregation to region level. Should be `CALCULATE(SUM('Sales'[Amount]), ALLEXCEPT('Sales', 'Sales'[Region]))`.
+
+### Example 4 — FAIL (Unsafe division)
+- ThoughtSpot: `sum(profit) / sum(revenue)`
+- DAX: `Profit Margin = SUM('Sales'[Profit]) / SUM('Sales'[Revenue])`
+- Verdict: NULL_HANDLING ✗ — Uses raw division instead of `DIVIDE(SUM('Sales'[Profit]), SUM('Sales'[Revenue]), 0)`.
+
+---
+
+## REASONING (Think step-by-step before answering)
+
+Before producing your JSON response, reason through these steps internally:
+1. **Parse the ThoughtSpot formula**: What aggregation, filter context, and dimensions does it use?
+2. **Parse the DAX formula**: Does it use the correct aggregation function? Is the table/column qualification correct?
+3. **Check Rule Violations**: Walk through Rules 1-13 above. Does the DAX violate any?
+4. **Compare Semantics**: Will both formulas produce the SAME result for any given set of slicers/filters?
+5. **Identify Error Category**: If they differ, classify the error precisely.
+
+---
+
+## OUTPUT FORMAT
+
+Respond ONLY with a JSON object (no markdown wraps, no explanation outside JSON):
 {{
   "overall_passed": true/false,
   "pass_rate": 1.0,
   "error_category": "PERFECT_MATCH",
-  "reason": "Explanation of validation findings...",
+  "reason": "Step-by-step explanation of your reasoning and findings...",
   "test_slices": [
      {{
        "dimensions": {{"Region": "North"}},
@@ -136,9 +424,11 @@ Respond ONLY with a JSON object in this format (no markdown code-block wraps):
      }}
   ]
 }}
+
+Error categories (use exactly one): "PERFECT_MATCH", "ROUNDING_ERROR", "NULL_HANDLING", "CONTEXT_SHIFT", "SCALE_ERROR", "AGGREGATION_MISMATCH", "NAKED_REFERENCE", "MISSING_VALUE"
 """
             logger.info("Requesting LLM semantic audit...")
-            response = llm.llm.invoke(prompt)
+            response = llm.invoke(prompt)
             
             # Parse & validate the response with Pydantic
             parsed_res = clean_and_validate_json(response.content, SemanticValidationResponse)

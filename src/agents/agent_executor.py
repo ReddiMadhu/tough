@@ -199,6 +199,17 @@ class DataModelAgent:
                              data={"source": edge.get("source", ""), "target": edge.get("target", "")},
                              message=f"Edge: {edge.get('source', '')} → {edge.get('target', '')}")
 
+            # Emit relationship events
+            joins = model.get("joins", [])
+            for i, join in enumerate(joins):
+                left_table = join.get("left_table", "")
+                right_table = join.get("right_table", "")
+                cardinality = join.get("cardinality", "MANY_TO_ONE").upper().replace("-", "_")
+                msg = f'Table "{left_table}" and "{right_table}" are joined with "key" key ({cardinality} relationship)'
+                emitter.emit("relationship_extracted", sub_phase="Extracting relationships", progress=50 + int((i + 1) / max(len(joins), 1) * 5),
+                             data={"left_table": left_table, "right_table": right_table, "cardinality": cardinality},
+                             message=msg)
+
             emitter.emit("graph_complete", sub_phase="Graph complete", progress=55,
                          data={"nodes": len(nodes), "edges": len(edges)},
                          message=f"Graph built: {len(nodes)} nodes, {len(edges)} edges")
@@ -281,14 +292,15 @@ class DaxConversionAgent:
             return json.load(f)
 
     def run(self, migration_id: str, emitter: AgentEventEmitter) -> Dict[str, Any]:
-        """Execute DAX conversion + validation + self-healing."""
+        """Execute DAX conversion using LangGraph pipeline + validation + self-healing."""
         start = time.time()
-        logger.info(f"[{migration_id}] DaxConversionAgent starting...")
+        logger.info(f"[{migration_id}] DaxConversionAgent starting (LangGraph pipeline)...")
 
         try:
             from src.thoughtspot.formula_converter import ThoughtSpotFormulaConverter
             from src.validation.validation_engine import ValidationEngine
             from src.agents.self_healer import SelfHealingAgent
+            from src.agents.dax_pipeline import build_dax_pipeline, make_initial_state
             from storage.migration_store import save_conversions, update_migration_progress
             from storage.fidelity_validation_store import save_validation_result, save_correction_attempt
 
@@ -300,19 +312,26 @@ class DaxConversionAgent:
                          data={"total_formulas": total_formulas},
                          message=f"Starting DAX conversion for {total_formulas} formulas...")
 
-            # Build column-table map
+            # ── Build column-table map ──
             col_table_map = {}
+            table_columns = {}
             for table in model.get("tables", []):
                 table_name = table.get("name", "")
+                cols = set()
                 for col in table.get("column_details", []):
-                    col_table_map[col.get("name", "")] = table_name
-                for col_name in table.get("columns", []):
+                    col_name = col.get("name", "")
+                    cols.add(col_name)
                     if col_name not in col_table_map:
                         col_table_map[col_name] = table_name
+                for col_name in table.get("columns", []):
+                    cols.add(col_name)
+                    if col_name not in col_table_map:
+                        col_table_map[col_name] = table_name
+                table_columns[table_name] = list(cols)
 
             default_table = model["tables"][0]["name"] if model.get("tables") else "Table"
 
-            # Build column metadata
+            # ── Build column metadata ──
             column_metadata = {}
             for table in model.get("tables", []):
                 for col in table.get("column_details", []):
@@ -328,179 +347,208 @@ class DaxConversionAgent:
                 column_metadata=column_metadata,
             )
 
-            # ── Convert each formula ──
-            dax_conversions = []
-            for i, col in enumerate(formula_columns):
-                measure_name = col.get("caption") or col.get("internal_name") or f"Measure_{i}"
+            # ── Dependency ordering: sort formulas by dependency_level ──
+            dep_level_map = {}
+            cyclic_formulas = set()
+            try:
+                from src.thoughtspot.logic_graph_builder import LogicGraphBuilder
+                builder = LogicGraphBuilder()
+                base_field_metadata = {}
+                for table in model.get("tables", []):
+                    t_name = table.get("name", "")
+                    for col in table.get("column_details", []):
+                        base_field_metadata[col.get("name", "")] = {
+                            "type": col.get("data_type", "VARCHAR"),
+                            "generic_type": "NUMERIC" if col.get("column_type") == "MEASURE" else "TEXT",
+                            "table": t_name,
+                        }
+                builder.build_graph(model, base_field_metadata)
 
-                emitter.emit("formula_converting", sub_phase="Converting formulas", progress=5 + int((i + 1) / max(total_formulas, 1) * 35),
-                             data={"formula_name": measure_name, "index": i + 1, "total": total_formulas},
-                             message=f"Converting: {measure_name}")
+                # Extract dependency levels
+                for name, node in builder.calculations.items():
+                    dep_level_map[name] = node.dependency_level
 
-                result = converter.convert(col["formula"], measure_name)
+                # Detect cycles: formulas not visited by Kahn's algorithm
+                calcs_dict = builder.to_dict()
+                visited_count = calcs_dict["stats"]["total_calculations"]
+                if visited_count < len(builder.calculations):
+                    logger.warning(f"[{migration_id}] Circular dependency detected in formula graph")
+                    # Formulas with no level assigned are in cycles
+                    all_calc_names = set(builder.calculations.keys())
+                    for name, node in builder.calculations.items():
+                        # Cycle detection: check if in-degree is still > 0 after topo sort
+                        if name not in dep_level_map:
+                            cyclic_formulas.add(name)
+            except Exception as e:
+                logger.warning(f"[{migration_id}] Could not build dependency order: {e}")
 
-                conv = {
-                    "conversion_id": f"conv_{uuid.uuid4().hex[:8]}",
-                    "measure_name": measure_name,
-                    "original_formula": col["formula"],
-                    "dax_formula": result.dax_formula,
-                    "confidence": result.confidence,
-                    "pattern": result.pattern,
-                    "notes": result.notes,
-                    "requires_review": result.requires_review,
-                    "format_pattern": col.get("format", ""),
-                    "source_object": col.get("source_object", ""),
-                    "source_object_type": col.get("source_object_type", ""),
-                }
-                dax_conversions.append(conv)
+            # Sort formula_columns by dependency level (level 1 first, unknown last)
+            def get_dep_level(col):
+                name = col.get("caption") or col.get("internal_name") or ""
+                return dep_level_map.get(name, 999)
 
-                emitter.emit("formula_converted", sub_phase="Converting formulas", progress=5 + int((i + 1) / max(total_formulas, 1) * 35),
-                             data={
-                                 "formula_name": measure_name,
-                                 "status": "success",
-                                 "confidence": result.confidence,
-                                 "dax_preview": result.dax_formula[:80] if result.dax_formula else "",
-                                 "requires_review": result.requires_review,
-                             },
-                             message=f"Converted: {measure_name} ({int(result.confidence * 100)}% confidence)")
+            formula_columns.sort(key=get_dep_level)
 
-            # ── Validate & Self-Heal ──
-            emitter.emit("validation_started", sub_phase="Validating conversions", progress=45,
-                         data={"total": total_formulas},
-                         message="Starting validation and self-healing loop...")
+            # ── Build known measures set (all formula names, available upfront) ──
+            known_measures = set()
+            for col in formula_columns:
+                name = col.get("caption") or col.get("internal_name") or ""
+                if name:
+                    known_measures.add(name)
 
-            val_engine = ValidationEngine()
-            healer = SelfHealingAgent(max_attempts=3)
-
-            # Build schema context for self-healer
+            # ── Build schema context string for healer ──
             schema_context_lines = [f"Primary table: '{default_table}'"]
             if col_table_map:
                 schema_context_lines.append("Known column mappings:")
-                for col_name, tbl in list(col_table_map.items())[:30]:
+                for col_name, tbl in col_table_map.items():
                     schema_context_lines.append(f"  - Column '{col_name}' is in table '{tbl}'")
-            known_measures = [c["measure_name"] for c in dax_conversions]
             if known_measures:
                 schema_context_lines.append("Known measure references:")
                 for m in known_measures:
                     schema_context_lines.append(f"  - Measure: [{m}]")
             schema_str = "\n".join(schema_context_lines)
 
+            # ── Initialize pipeline tools ──
+            val_engine = ValidationEngine()
+            healer = SelfHealingAgent(max_attempts=3)
+            pipeline = build_dax_pipeline()
+
+            # ── Process each formula through the LangGraph pipeline ──
+            dax_conversions = []
             healed_count = 0
             failed_count = 0
 
-            for idx, conv in enumerate(dax_conversions):
-                c_id = conv["conversion_id"]
-                meas_name = conv["measure_name"]
-                orig_f = conv["original_formula"]
-                curr_dax = conv["dax_formula"]
-                conf = conv["confidence"]
+            for i, col in enumerate(formula_columns):
+                measure_name = col.get("caption") or col.get("internal_name") or f"Measure_{i}"
 
-                # Run validation
-                val_res = val_engine.validate(c_id, orig_f, curr_dax, meas_name, conf, migration_id)
-                save_validation_result(self.db_path, migration_id, c_id, val_res)
-
-                # ── Temporary Debug Logging for Diagnostics (Initial validation) ──
-                debug_log_paths = [
-                    Path(self.export_dir) / migration_id / "dax_healing_debug.log",
-                    Path(self.export_dir).resolve().parent / "dax_healing_debug.log"
-                ]
-                for p in debug_log_paths:
-                    p.parent.mkdir(parents=True, exist_ok=True)
-                    with open(p, "a", encoding="utf-8") as debug_file:
-                        debug_file.write(f"\n{'='*80}\n")
-                        debug_file.write(f"MIGRATION ID                  : {migration_id}\n")
-                        debug_file.write(f"MEASURE NAME                  : {meas_name}\n")
-                        debug_file.write(f"ORIGINAL THOUGHTSPOT FORMULA  :\n{orig_f}\n\n")
-                        debug_file.write(f"INITIAL TRANSLATED DAX        :\n{curr_dax}\n\n")
-                        debug_file.write(f"INITIAL VALIDATION RESULT     :\n")
-                        debug_file.write(f"  Passed                      : {val_res.get('overall_passed')}\n")
-                        debug_file.write(f"  Pass Rate                   : {val_res.get('pass_rate')}\n")
-                        debug_file.write(f"  Validation Discrepancies    :\n{json.dumps(val_res.get('test_slices', []), indent=2)}\n")
-                        debug_file.write(f"{'='*80}\n")
-
-                if val_res.get("overall_passed"):
-                    emitter.emit("validation_passed", sub_phase="Validating", progress=45 + int((idx + 1) / max(total_formulas, 1) * 45),
-                                 data={"formula_name": meas_name, "status": "passed"},
-                                 message=f"✓ Validation passed: {meas_name}")
-                else:
-                    emitter.emit("validation_failed", sub_phase="Validating", progress=45 + int((idx + 1) / max(total_formulas, 1) * 45),
-                                 data={"formula_name": meas_name, "status": "failed"},
-                                 message=f"✗ Validation failed: {meas_name}")
-
-                    # Self-healing loop
-                    attempt_num = 1
-                    while not val_res.get("overall_passed") and attempt_num <= 3:
-                        emitter.emit("healing_attempt", sub_phase="Self-healing", progress=45 + int((idx + 1) / max(total_formulas, 1) * 45),
-                                     data={
-                                         "formula_name": meas_name,
-                                         "attempt": attempt_num,
-                                         "max_attempts": 3,
-                                     },
-                                     message=f"Healing attempt {attempt_num}/3 for {meas_name}...")
-
-                        # ── Logging specific healing attempt inputs ──
-                        for p in debug_log_paths:
-                            with open(p, "a", encoding="utf-8") as debug_file:
-                                debug_file.write(f"\n{'='*80}\n")
-                                debug_file.write(f"MIGRATION ID                  : {migration_id}\n")
-                                debug_file.write(f"MEASURE NAME                  : {meas_name}\n")
-                                debug_file.write(f"HEALING CYCLE                 : Attempt {attempt_num} / 3\n")
-                                debug_file.write(f"INPUT FAILED DAX FORMULA      :\n{curr_dax}\n\n")
-                                debug_file.write(f"INPUT VALIDATION FAILURES     :\n{json.dumps(val_res.get('test_slices', []), indent=2)}\n\n")
-
-                        attempt = healer.correct_dax(
-                            original_formula=orig_f,
-                            failed_dax=curr_dax,
-                            failures=val_res.get("test_slices", []),
-                            attempt_number=attempt_num,
-                            measure_name=meas_name,
-                            schema_context=schema_str,
-                        )
-                        save_correction_attempt(self.db_path, migration_id, c_id, attempt)
-
-                        curr_dax = attempt["corrected_dax"]
-                        val_res = val_engine.validate(c_id, orig_f, curr_dax, meas_name, conf, migration_id)
-                        save_validation_result(self.db_path, migration_id, c_id, val_res)
-
-                        for p in debug_log_paths:
-                            with open(p, "a", encoding="utf-8") as debug_file:
-                                debug_file.write(f"HEALER LLM DIAGNOSIS          :\n")
-                                debug_file.write(f"  Root Cause   : {attempt.get('root_cause')}\n")
-                                debug_file.write(f"  Explanation  : {attempt.get('explanation')}\n")
-                                debug_file.write(f"  Changes Made : {attempt.get('changes_made')}\n\n")
-                                debug_file.write(f"OUTPUT HEALED DAX FORMULA     :\n{curr_dax}\n\n")
-                                debug_file.write(f"POST-HEALING VALIDATION STATE :\n")
-                                debug_file.write(f"  Passed       : {val_res.get('overall_passed')}\n")
-                                debug_file.write(f"  Pass Rate    : {val_res.get('pass_rate')}\n")
-                                debug_file.write(f"  Failures Left: {json.dumps(val_res.get('test_slices', []), indent=2)}\n")
-                                debug_file.write(f"{'='*80}\n")
-
-                        if val_res.get("overall_passed"):
-                            emitter.emit("healing_success", sub_phase="Self-healing", progress=45 + int((idx + 1) / max(total_formulas, 1) * 45),
-                                         data={"formula_name": meas_name, "attempt": attempt_num},
-                                         message=f"✓ Healed on attempt {attempt_num}: {meas_name}")
-                            healed_count += 1
-                            break
-                        else:
-                            emitter.emit("healing_failed", sub_phase="Self-healing", progress=45 + int((idx + 1) / max(total_formulas, 1) * 45),
-                                         data={"formula_name": meas_name, "attempt": attempt_num},
-                                         message=f"✗ Attempt {attempt_num} failed for {meas_name}")
-
-                        attempt_num += 1
-
-                # Update conversion
-                conv["dax_formula"] = curr_dax
-                if val_res.get("overall_passed"):
-                    conv["confidence"] = 1.0
-                    conv["requires_review"] = False
-                else:
-                    conv["confidence"] = min(conv["confidence"], 0.5)
-                    conv["requires_review"] = True
+                # Check for circular dependencies — skip immediately
+                if measure_name in cyclic_formulas:
+                    logger.warning(f"[{migration_id}] Skipping cyclic formula: {measure_name}")
+                    emitter.emit("formula_circular", sub_phase="DAX Conversion",
+                                 progress=5 + int((i + 1) / max(total_formulas, 1) * 85),
+                                 data={"formula_name": measure_name, "status": "circular_dependency"},
+                                 message=f"⚠ Circular dependency: {measure_name}")
+                    conv = {
+                        "conversion_id": f"conv_{uuid.uuid4().hex[:8]}",
+                        "measure_name": measure_name,
+                        "original_formula": col["formula"],
+                        "dax_formula": f"-- {measure_name}: Circular dependency detected\n{measure_name} = BLANK()  -- TODO: Break circular reference",
+                        "confidence": 0.0,
+                        "pattern": "CIRCULAR_DEPENDENCY",
+                        "notes": ["Circular dependency detected in calculation graph — manual resolution required"],
+                        "requires_review": True,
+                        "format_pattern": col.get("format", ""),
+                        "source_object": col.get("source_object", ""),
+                        "source_object_type": col.get("source_object_type", ""),
+                    }
+                    dax_conversions.append(conv)
                     failed_count += 1
-                    if "Self-healing could not fully resolve validation discrepancies. Manual review required." not in conv["notes"]:
-                        conv["notes"].append("Self-healing could not fully resolve validation discrepancies. Manual review required.")
+                    continue
 
-            # Save conversions to DB
+                # Build initial state for this formula
+                initial_state = make_initial_state(
+                    formula_name=measure_name,
+                    original_ts=col["formula"],
+                    formula_index=i,
+                    total_formulas=total_formulas,
+                    max_attempts=3,
+                )
+
+                # Build config with shared context
+                pipeline_config = {
+                    "configurable": {
+                        "emitter": emitter,
+                        "converter": converter,
+                        "val_engine": val_engine,
+                        "healer": healer,
+                        "col_table_map": col_table_map,
+                        "column_metadata": column_metadata,
+                        "known_measures": known_measures,
+                        "schema_context": schema_str,
+                        "migration_id": migration_id,
+                        "table_columns": table_columns,
+                    }
+                }
+
+                # Run the LangGraph pipeline for this formula
+                try:
+                    final_state = pipeline.invoke(initial_state, config=pipeline_config)
+                except Exception as e:
+                    logger.error(f"[{migration_id}] Pipeline failed for {measure_name}: {e}")
+                    final_state = {
+                        "translated_dax": f"{measure_name} = BLANK()  -- Pipeline error: {str(e)[:100]}",
+                        "translation_confidence": 0.0,
+                        "translation_pattern": "ERROR",
+                        "translation_notes": [f"Pipeline error: {str(e)}"],
+                        "requires_review": True,
+                        "final_status": "failed",
+                        "healing_attempts": [],
+                        "semantic_result": None,
+                    }
+
+                # Extract results from final state
+                final_dax = final_state.get("translated_dax", f"{measure_name} = BLANK()")
+                final_confidence = final_state.get("translation_confidence", 0.0)
+                final_status = final_state.get("final_status", "")
+                healing_attempts = final_state.get("healing_attempts", [])
+                semantic_result = final_state.get("semantic_result")
+
+                # Determine final status
+                if final_status == "passed" or (final_state.get("semantic_passed") or final_state.get("syntax_passed") and final_state.get("schema_passed")):
+                    if healing_attempts:
+                        healed_count += 1
+                        final_confidence = max(final_confidence, 0.85)
+                    else:
+                        final_confidence = max(final_confidence, 0.90)
+                    requires_review = False
+                else:
+                    final_confidence = min(final_confidence, 0.5)
+                    requires_review = True
+                    failed_count += 1
+
+                # Save validation result if available
+                conv_id = f"conv_{uuid.uuid4().hex[:8]}"
+                if semantic_result:
+                    save_validation_result(self.db_path, migration_id, conv_id, semantic_result)
+
+                # Save healing attempts
+                for attempt in healing_attempts:
+                    save_correction_attempt(self.db_path, migration_id, conv_id, attempt)
+
+                # Build conversion record
+                notes = list(final_state.get("translation_notes", []))
+                if healing_attempts:
+                    notes.append(f"Auto-fixed after {len(healing_attempts)} attempt(s)")
+                if final_status == "failed" and healing_attempts:
+                    notes.append("Auto-Fix could not fully resolve validation issues. Manual review required.")
+
+                conv = {
+                    "conversion_id": conv_id,
+                    "measure_name": measure_name,
+                    "original_formula": col["formula"],
+                    "dax_formula": final_dax,
+                    "confidence": final_confidence,
+                    "pattern": final_state.get("translation_pattern", "UNKNOWN"),
+                    "notes": notes,
+                    "requires_review": requires_review,
+                    "format_pattern": col.get("format", ""),
+                    "source_object": col.get("source_object", ""),
+                    "source_object_type": col.get("source_object_type", ""),
+                }
+                dax_conversions.append(conv)
+
+                # Log to debug file
+                debug_log_path = Path(self.export_dir) / migration_id / "dax_healing_debug.log"
+                debug_log_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(debug_log_path, "a", encoding="utf-8") as debug_file:
+                    debug_file.write(f"\n{'='*80}\n")
+                    debug_file.write(f"MEASURE: {measure_name} | STATUS: {final_status}\n")
+                    debug_file.write(f"ORIGINAL: {col['formula']}\n")
+                    debug_file.write(f"FINAL DAX: {final_dax}\n")
+                    debug_file.write(f"CONFIDENCE: {final_confidence} | HEALED: {len(healing_attempts)} attempts\n")
+                    debug_file.write(f"{'='*80}\n")
+
+            # ── Save conversions to DB ──
             save_conversions(self.db_path, migration_id, dax_conversions)
             update_migration_progress(self.db_path, migration_id, 55, "converting", "DAX conversion complete")
 

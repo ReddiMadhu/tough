@@ -197,8 +197,18 @@ class PBIPGenerator:
                 continue
 
             # Extract expression part (after "Name = ")
+            # Only strip the "MeasureName = " prefix if it exactly matches the measure name
+            # to avoid incorrectly cutting DAX filter expressions that contain comparison " = " operators.
             eq_pos = dax.find(" = ")
-            dax_expr = dax[eq_pos + 3:].strip() if eq_pos >= 0 else dax
+            if eq_pos >= 0:
+                left_part = dax[:eq_pos].strip()
+                clean_left = left_part.strip("'\"[]")
+                if clean_left == measure_name:
+                    dax_expr = dax[eq_pos + 3:].strip()
+                else:
+                    dax_expr = dax
+            else:
+                dax_expr = dax
 
             # Remove any leading comment lines from the expression
             expr_lines = dax_expr.split("\n")

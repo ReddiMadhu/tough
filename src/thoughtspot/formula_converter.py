@@ -148,6 +148,12 @@ class ThoughtSpotFormulaConverter:
     def _get_table_and_col(self, col: str) -> Tuple[str, str]:
         """Get (table_name, column_name) for a given column reference, with fallbacks."""
         col = col.strip().strip("'\"")
+        if "::" in col:
+            parts = col.split("::")
+            tbl = parts[0].strip().strip("[]'")
+            col_name = parts[-1].strip().strip("[]'")
+            return tbl, col_name
+
         norm = self._normalize_identifier(col)
         if norm in self.norm_col_map:
             table, orig_name = self.norm_col_map[norm]
@@ -162,7 +168,10 @@ class ThoughtSpotFormulaConverter:
         """Resolve a single column/measure name to its DAX reference format."""
         col_name = col_name.strip().strip("[]")
         if "::" in col_name:
-            col_name = col_name.split("::")[-1].strip().strip("[]")
+            parts = col_name.split("::")
+            tbl = parts[0].strip().strip("[]'")
+            col = parts[-1].strip().strip("[]'")
+            return f"'{tbl}'[{col}]"
             
         norm = self._normalize_identifier(col_name)
         
@@ -248,7 +257,10 @@ class ThoughtSpotFormulaConverter:
             
         # Handle 'Table::Column' or 'Table::[Column]' format
         if "::" in col:
-            col = col.split("::")[-1].strip().strip("[]")
+            parts = col.split("::")
+            tbl = parts[0].strip().strip("[]'")
+            col_name = parts[-1].strip().strip("[]'")
+            return f"'{tbl}'[{col_name}]"
             
         resolved = self._resolve_col_name_only(col)
         if resolved:
@@ -657,11 +669,11 @@ class ThoughtSpotFormulaConverter:
                     schema_context.append(f"Primary table: '{self.default_table}'")
                 if self.col_table_map:
                     schema_context.append("Known column mappings:")
-                    for col, tbl in list(self.col_table_map.items())[:20]:
+                    for col, tbl in self.col_table_map.items():
                         schema_context.append(f"  - Column '{col}' is in table '{tbl}'")
                 if self.known_measures:
                     schema_context.append("Known measure references:")
-                    for m in list(self.known_measures)[:20]:
+                    for m in self.known_measures:
                         schema_context.append(f"  - Measure: [{m}]")
                 schema_str = "\n".join(schema_context)
 
