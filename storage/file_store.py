@@ -49,7 +49,23 @@ class FileStore:
 
     def static_pbip_dir(self) -> Path:
         """Return the static pbip-ts directory (pre-built PBIP project)."""
-        return Path(__file__).resolve().parent.parent / "pbip-ts"
+        # Candidate 1: relative to file_store.py (bknd-ts/storage/file_store.py -> bknd-ts/pbip-ts)
+        path1 = Path(__file__).resolve().parent.parent / "pbip-ts"
+        if path1.exists() and path1.is_dir():
+            return path1
+
+        # Candidate 2: relative to current working directory
+        path2 = Path("pbip-ts").resolve()
+        if path2.exists() and path2.is_dir():
+            return path2
+
+        # Candidate 3: relative to parent of current working directory
+        path3 = Path("../pbip-ts").resolve()
+        if path3.exists() and path3.is_dir():
+            return path3
+
+        # Default fallback to Candidate 1
+        return path1
 
     def full_zip_path(self, migration_id: str) -> Path:
         return self.export_dir(migration_id) / f"{migration_id}_powerbi_output.zip"

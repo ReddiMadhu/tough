@@ -201,15 +201,16 @@ async def download_output(
 
     # For PBIP downloads, always zip and serve the static pbip-ts directory
     if file == "pbip":
-        import shutil
         static_pbip = _file_store.static_pbip_dir()
+        logger.info(f"PBIP Download: Checking static pbip directory at {static_pbip}")
         if not static_pbip.exists():
-            raise HTTPException(status_code=404, detail="Static PBIP project (pbip-ts) not found on server")
+            logger.error(f"PBIP Download Error: static pbip directory not found at {static_pbip}")
+            raise HTTPException(status_code=404, detail=f"Static PBIP project (pbip-ts) not found on server at {static_pbip}")
         # Create a zip of the pbip-ts directory in the export folder
         export_dir = _file_store.export_dir(migration_id)
-        pbip_zip = export_dir / f"{migration_id}_pbip"
-        # shutil.make_archive adds .zip extension automatically
-        zip_path = Path(shutil.make_archive(str(pbip_zip), 'zip', str(static_pbip.parent), static_pbip.name))
+        from src.export.zip_packager import package_pbip_only
+        zip_path = Path(package_pbip_only(str(static_pbip), str(export_dir), migration_id))
+        logger.info(f"PBIP Download: Successfully zipped {static_pbip} to {zip_path}")
         media_type, filename = MEDIA_TYPES["pbip"]
         return FileResponse(path=str(zip_path), media_type=media_type, filename=filename)
 
