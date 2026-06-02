@@ -199,6 +199,20 @@ async def download_output(
     if file not in MEDIA_TYPES:
         raise HTTPException(status_code=400, detail=f"Invalid file param. Use: {', '.join(MEDIA_TYPES.keys())}")
 
+    # For PBIP downloads, always zip and serve the static pbip-ts directory
+    if file == "pbip":
+        import shutil
+        static_pbip = _file_store.static_pbip_dir()
+        if not static_pbip.exists():
+            raise HTTPException(status_code=404, detail="Static PBIP project (pbip-ts) not found on server")
+        # Create a zip of the pbip-ts directory in the export folder
+        export_dir = _file_store.export_dir(migration_id)
+        pbip_zip = export_dir / f"{migration_id}_pbip"
+        # shutil.make_archive adds .zip extension automatically
+        zip_path = Path(shutil.make_archive(str(pbip_zip), 'zip', str(static_pbip.parent), static_pbip.name))
+        media_type, filename = MEDIA_TYPES["pbip"]
+        return FileResponse(path=str(zip_path), media_type=media_type, filename=filename)
+
     path = _file_store.get_download_path(migration_id, file)
     media_type, filename = MEDIA_TYPES[file]
 
@@ -830,9 +844,9 @@ async def start_agent(
     from workers.agent_stream_manager import agent_stream_manager
     agent_stream_manager.clear_history(migration_id, agent_name)
 
-    # Mark as running BEFORE scheduling the background task.
-    # This ensures the stream endpoint sees 'running' and does NOT
-    # short-circuit to 'completed' based on stale DB data.
+    # Mark as running BEFORE scheduling background task — this ensures the SSE
+    # stream endpoint sees "running" immediately, even if the background thread
+    # hasn't started yet (closes the timing race window)
     _running_agents[agent_key] = "running"
 
     background_tasks.add_task(_run_agent_background, migration_id, agent_slug)
@@ -873,13 +887,15 @@ async def stream_agent(migration_id: str, agent_slug: str):
         }
         yield f"data: {json.dumps(initial)}\n\n"
 
-        # Only short-circuit if the agent is NOT currently running.
-        # If _running_agents says 'running', the agent was just started — 
-        # never short-circuit based on stale DB data in that case.
+        # Check if agent is currently running — if so, ALWAYS connect to live queue
+        # (skip the "already completed" short-circuit to avoid the race condition
+        # where stale DB/filesystem artifacts from a previous run cause the stream
+        # to close immediately before the new run emits any events)
         agent_key = f"{migration_id}:{agent_name}"
-        is_actively_running = _running_agents.get(agent_key) == "running"
+        is_currently_running = _running_agents.get(agent_key) == "running"
 
-        if not is_actively_running:
+        if not is_currently_running:
+            # Only short-circuit if the agent is NOT actively running
             current_status = _get_agent_status(migration_id, agent_slug)
             if current_status == "completed":
                 completed = {

@@ -47,6 +47,10 @@ class FileStore:
         """Return the PBIP project subdirectory."""
         return self.export_dir(migration_id) / "pbip"
 
+    def static_pbip_dir(self) -> Path:
+        """Return the static pbip-ts directory (pre-built PBIP project)."""
+        return Path(__file__).resolve().parent.parent / "pbip-ts"
+
     def full_zip_path(self, migration_id: str) -> Path:
         return self.export_dir(migration_id) / f"{migration_id}_powerbi_output.zip"
 
