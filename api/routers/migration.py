@@ -666,6 +666,50 @@ _AGENT_NAME_MAP = {
 _running_agents: Dict[str, str] = {}
 
 
+def _get_agent_status(migration_id: str, agent_slug: str) -> str:
+    """Get the current running or persistent status of an agent."""
+    if agent_slug not in _VALID_AGENTS:
+        return "not_started"
+
+    agent_name = _AGENT_NAME_MAP[agent_slug]
+    agent_key = f"{migration_id}:{agent_name}"
+
+    # Check in-memory state first (primary source for active runs)
+    if agent_key in _running_agents:
+        return _running_agents[agent_key]
+
+    # Process-safe fallback: inspect database and filesystem
+    try:
+        from storage.migration_store import get_migration, get_migration_conversions, get_calculations
+        row = get_migration(config.DATABASE_PATH, migration_id)
+        if not row:
+            return "not_started"
+
+        if agent_name == "source_analysis":
+            from pathlib import Path
+            export_path = Path(config.EXPORT_DIR) / migration_id
+            if (export_path / f"{migration_id}_intermediate_model.json").exists() or (export_path / f"model_{migration_id}.json").exists():
+                return "completed"
+
+        elif agent_name == "data_model":
+            calcs = get_calculations(config.DATABASE_PATH, migration_id)
+            if calcs or row.get("logic_graph_json"):
+                return "completed"
+
+        elif agent_name == "dax_conversion":
+            conversions = get_migration_conversions(config.DATABASE_PATH, migration_id)
+            if conversions:
+                return "completed"
+
+        elif agent_name == "export":
+            if row.get("status") == "completed":
+                return "completed"
+    except Exception as e:
+        logger.warning(f"Failed to check persistent status for agent {agent_slug}: {e}")
+
+    return "not_started"
+
+
 def _run_agent_background(migration_id: str, agent_slug: str):
     """Run a specific agent in a background thread."""
     agent_name = _AGENT_NAME_MAP[agent_slug]
@@ -724,12 +768,23 @@ async def start_agent(
     agent_name = _AGENT_NAME_MAP[agent_slug]
     agent_key = f"{migration_id}:{agent_name}"
 
+    current_status = _get_agent_status(migration_id, agent_slug)
+
     # Prevent double-starts
-    if _running_agents.get(agent_key) == "running":
+    if current_status == "running":
         return JSONResponse(
             status_code=409,
             content={"detail": f"Agent '{agent_slug}' is already running for this migration."}
         )
+
+    # If already completed, return completed status immediately
+    if current_status == "completed":
+        return {
+            "migration_id": migration_id,
+            "agent": agent_slug,
+            "status": "completed",
+            "message": f"Agent '{agent_slug}' has already completed.",
+        }
 
     background_tasks.add_task(_run_agent_background, migration_id, agent_slug)
     logger.info(f"Agent '{agent_slug}' triggered for migration {migration_id}")
@@ -768,6 +823,33 @@ async def stream_agent(migration_id: str, agent_slug: str):
             "message": f"Connected to {agent_slug} stream",
         }
         yield f"data: {json.dumps(initial)}\n\n"
+
+        # Check if already completed or failed
+        current_status = _get_agent_status(migration_id, agent_slug)
+        if current_status == "completed":
+            completed = {
+                "type": "agent_complete",
+                "agent": agent_name,
+                "event": "agent_complete",
+                "data": {},
+                "sub_phase": "complete",
+                "progress": 100,
+                "message": f"Agent '{agent_slug}' already completed",
+            }
+            yield f"data: {json.dumps(completed)}\n\n"
+            return
+        elif current_status == "failed":
+            failed = {
+                "type": "agent_failed",
+                "agent": agent_name,
+                "event": "agent_failed",
+                "data": {"error": "Agent already failed"},
+                "sub_phase": "failed",
+                "progress": -1,
+                "message": f"Agent '{agent_slug}' already failed",
+            }
+            yield f"data: {json.dumps(failed)}\n\n"
+            return
 
         queue = agent_stream_manager.register_queue(migration_id, agent_name)
         try:
