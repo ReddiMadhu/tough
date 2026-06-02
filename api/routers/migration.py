@@ -830,6 +830,11 @@ async def start_agent(
     from workers.agent_stream_manager import agent_stream_manager
     agent_stream_manager.clear_history(migration_id, agent_name)
 
+    # Mark as running BEFORE scheduling the background task.
+    # This ensures the stream endpoint sees 'running' and does NOT
+    # short-circuit to 'completed' based on stale DB data.
+    _running_agents[agent_key] = "running"
+
     background_tasks.add_task(_run_agent_background, migration_id, agent_slug)
     logger.info(f"Agent '{agent_slug}' triggered for migration {migration_id}")
 
@@ -868,32 +873,38 @@ async def stream_agent(migration_id: str, agent_slug: str):
         }
         yield f"data: {json.dumps(initial)}\n\n"
 
-        # Check if already completed or failed
-        current_status = _get_agent_status(migration_id, agent_slug)
-        if current_status == "completed":
-            completed = {
-                "type": "agent_complete",
-                "agent": agent_name,
-                "event": "agent_complete",
-                "data": {},
-                "sub_phase": "complete",
-                "progress": 100,
-                "message": f"Agent '{agent_slug}' already completed",
-            }
-            yield f"data: {json.dumps(completed)}\n\n"
-            return
-        elif current_status == "failed":
-            failed = {
-                "type": "agent_failed",
-                "agent": agent_name,
-                "event": "agent_failed",
-                "data": {"error": "Agent already failed"},
-                "sub_phase": "failed",
-                "progress": -1,
-                "message": f"Agent '{agent_slug}' already failed",
-            }
-            yield f"data: {json.dumps(failed)}\n\n"
-            return
+        # Only short-circuit if the agent is NOT currently running.
+        # If _running_agents says 'running', the agent was just started — 
+        # never short-circuit based on stale DB data in that case.
+        agent_key = f"{migration_id}:{agent_name}"
+        is_actively_running = _running_agents.get(agent_key) == "running"
+
+        if not is_actively_running:
+            current_status = _get_agent_status(migration_id, agent_slug)
+            if current_status == "completed":
+                completed = {
+                    "type": "agent_complete",
+                    "agent": agent_name,
+                    "event": "agent_complete",
+                    "data": {},
+                    "sub_phase": "complete",
+                    "progress": 100,
+                    "message": f"Agent '{agent_slug}' already completed",
+                }
+                yield f"data: {json.dumps(completed)}\n\n"
+                return
+            elif current_status == "failed":
+                failed = {
+                    "type": "agent_failed",
+                    "agent": agent_name,
+                    "event": "agent_failed",
+                    "data": {"error": "Agent already failed"},
+                    "sub_phase": "failed",
+                    "progress": -1,
+                    "message": f"Agent '{agent_slug}' already failed",
+                }
+                yield f"data: {json.dumps(failed)}\n\n"
+                return
 
         queue = agent_stream_manager.register_queue(migration_id, agent_name)
         try:
