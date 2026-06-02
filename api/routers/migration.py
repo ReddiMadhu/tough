@@ -246,7 +246,7 @@ async def update_conversion(
     conversion_id: str,
     request: UpdateConversionRequest
 ):
-    """Update a specific DAX conversion manually."""
+    """Update a specific DAX conversion manually and validate against demo overrides."""
     row = get_migration(config.DATABASE_PATH, migration_id)
     if not row:
         raise HTTPException(status_code=404, detail="Migration not found")
@@ -256,20 +256,57 @@ async def update_conversion(
         conn = sqlite3.connect(config.DATABASE_PATH)
         cursor = conn.cursor()
         
-        cursor.execute("SELECT id FROM ts_conversions WHERE conversion_id = ?", (conversion_id,))
+        cursor.execute("SELECT id, measure_name FROM ts_conversions WHERE conversion_id = ?", (conversion_id,))
         conv = cursor.fetchone()
         if not conv:
             raise HTTPException(status_code=404, detail="Conversion not found")
             
-        # For the demo, we assume the user edits the DAX correctly and we trust it.
-        # Mark it as validated/passed with high confidence.
+        measure_name = conv[1]
+        
+        # Load expected demo overrides to validate manual formula update
+        import json
+        from pathlib import Path
+        overrides_path = Path(__file__).parent.parent.parent / "demo_overrides.json"
+        
+        is_valid = True
+        notes_list = ["Manually updated and verified by user"]
+        
+        if overrides_path.exists():
+            try:
+                with open(overrides_path, "r", encoding="utf-8") as f:
+                    overrides = json.load(f)
+                
+                # Check if the measure name exists in demo overrides
+                if measure_name in overrides:
+                    expected_dax = overrides[measure_name].get("dax", "")
+                    
+                    # Robust space, casing, and quote normalization
+                    def clean(s: str) -> str:
+                        import re
+                        s = s.strip().lower()
+                        s = re.sub(r'\s+', ' ', s)
+                        s = s.replace('"', "'")
+                        return s
+                    
+                    if clean(request.dax_formula) == clean(expected_dax):
+                        is_valid = True
+                        notes_list = ["Manually updated and verified by user (validation passed against demo expected formula)"]
+                    else:
+                        is_valid = False
+                        notes_list = ["Manual edit failed validation: does not match expected demo override formula"]
+            except Exception as oe:
+                logger.warning(f"Error reading demo overrides during manual update: {oe}")
+                
+        requires_review_val = 0 if is_valid else 1
+        confidence_val = 1.0 if is_valid else 0.3
+        
         cursor.execute(
             '''
             UPDATE ts_conversions 
-            SET dax_formula = ?, requires_review = 0, confidence = 1.0, notes = '["Manually updated and verified by user"]'
+            SET dax_formula = ?, requires_review = ?, confidence = ?, notes = ?
             WHERE conversion_id = ?
             ''',
-            (request.dax_formula, conversion_id)
+            (request.dax_formula, requires_review_val, confidence_val, json.dumps(notes_list), conversion_id)
         )
         conn.commit()
     except Exception as e:
@@ -280,9 +317,10 @@ async def update_conversion(
             conn.close()
             
     return {
-        "status": "success", 
-        "message": "Conversion updated and validated successfully",
-        "dax_formula": request.dax_formula
+        "status": "success" if is_valid else "failed", 
+        "message": "Conversion updated and validated successfully" if is_valid else "Formula failed validation",
+        "dax_formula": request.dax_formula,
+        "is_valid": is_valid
     }
 
 
