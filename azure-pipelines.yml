@@ -1,0 +1,81 @@
+# Azure DevOps CI/CD Pipeline — bknd-ts (Python FastAPI backend)
+# Deploys to Azure App Service (Linux) using zip-deploy.
+
+trigger:
+  branches:
+    include:
+      - main
+
+variables:
+  azureSubscription: 'YOUR_SERVICE_CONNECTION_NAME'   # ← replace with your Azure service connection
+  appServiceName:    'YOUR_APP_SERVICE_NAME'           # ← replace with your Azure App Service name
+  pythonVersion:     '3.12'
+  workingDirectory:  '$(System.DefaultWorkingDirectory)'
+
+pool:
+  name: 'YOUR_POOL_NAME'   # ← replace with your agent pool (e.g. 'Azure Pipelines', 'Default', or a self-hosted pool)
+  vmImage: 'ubuntu-latest'  # remove this line if using a self-hosted pool
+
+stages:
+
+# ──────────────────────────────────────────────
+# Stage 1 — Build
+# ──────────────────────────────────────────────
+- stage: Build
+  displayName: 'Build & Package'
+  jobs:
+  - job: BuildJob
+    displayName: 'Install deps & create artifact'
+    steps:
+
+    - task: UsePythonVersion@0
+      displayName: 'Use Python $(pythonVersion)'
+      inputs:
+        versionSpec: '$(pythonVersion)'
+
+    - script: |
+        python -m venv antenv
+        source antenv/bin/activate
+        pip install --upgrade pip
+        pip install -r requirements.txt
+      displayName: 'Create venv & install dependencies'
+      workingDirectory: '$(workingDirectory)'
+
+    - task: ArchiveFiles@2
+      displayName: 'Zip deployment package'
+      inputs:
+        rootFolderOrFile: '$(workingDirectory)'
+        includeRootFolder: false
+        archiveType: 'zip'
+        archiveFile: '$(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip'
+        replaceExistingArchive: true
+
+    - publish: '$(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip'
+      displayName: 'Upload artifact'
+      artifact: drop
+
+# ──────────────────────────────────────────────
+# Stage 2 — Deploy
+# ──────────────────────────────────────────────
+- stage: Deploy
+  displayName: 'Deploy to Azure App Service'
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - deployment: DeployJob
+    displayName: 'Deploy bknd-ts'
+    environment: 'production'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          - task: AzureWebApp@1
+            displayName: 'Deploy to $(appServiceName)'
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              appType: 'webAppLinux'
+              appName: '$(appServiceName)'
+              package: '$(Pipeline.Workspace)/drop/$(Build.BuildId).zip'
+              runtimeStack: 'PYTHON|$(pythonVersion)'
+              startUpCommand: 'bash startup.sh'
